@@ -313,6 +313,18 @@ defmodule CymphonyElixir.Orchestrator do
         Logger.error("Linear project slug missing in WORKFLOW.md")
         state
 
+      {:error, :missing_youtrack_token} ->
+        Logger.error("YouTrack token missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_youtrack_url} ->
+        Logger.error("YouTrack instance URL (tracker.endpoint) missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_youtrack_project} ->
+        Logger.error("YouTrack project short name missing in WORKFLOW.md")
+        state
+
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
@@ -340,7 +352,7 @@ defmodule CymphonyElixir.Orchestrator do
         state
 
       {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+        Logger.error("Failed to fetch issues from the tracker: #{inspect(reason)}")
         state
     end
   end
@@ -614,7 +626,7 @@ defmodule CymphonyElixir.Orchestrator do
 
   defp waiting_eligible?(%Issue{} = issue, %State{} = state, active_states, terminal_states) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(state), terminal_states) and
       !MapSet.member?(state.claimed, issue.id) and
       !Map.has_key?(state.running, issue.id) and
       !Map.has_key?(state.retry_attempts, issue.id)
@@ -683,7 +695,7 @@ defmodule CymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(state), terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -743,17 +755,21 @@ defmodule CymphonyElixir.Orchestrator do
   #
   # A blocker is considered non-terminal when its state name (case-insensitive,
   # normalized via `normalize_issue_state/1`) is not in `terminal_states`. The
-  # rule applies only when the issue itself is in the Todo state — issues
-  # already in progress are allowed to run even when blockers remain open, so
-  # an in-flight worker can finish what it started.
+  # rule applies only while the issue itself is in one of
+  # `tracker.queued_states` (`Todo` by default) — issues already in progress
+  # are allowed to run even when blockers remain open, so an in-flight worker
+  # can finish what it started. The set is configurable because the state that
+  # means "queued" is the tracker's word, not ours: YouTrack's stock workflow
+  # calls it `Open`.
   #
   # Returns `true` when the issue should NOT be dispatched, `false` otherwise.
-  defp todo_issue_blocked_by_non_terminal?(
+  defp queued_issue_blocked_by_non_terminal?(
          %Issue{state: issue_state, blocked_by: blockers},
+         queued_states,
          terminal_states
        )
        when is_binary(issue_state) and is_list(blockers) do
-    normalize_issue_state(issue_state) == "todo" and
+    queued_issue_state?(issue_state, queued_states) and
       Enum.any?(blockers, fn
         %{state: blocker_state} when is_binary(blocker_state) ->
           !terminal_issue_state?(blocker_state, terminal_states)
@@ -763,7 +779,13 @@ defmodule CymphonyElixir.Orchestrator do
       end)
   end
 
-  defp todo_issue_blocked_by_non_terminal?(_issue, _terminal_states), do: false
+  defp queued_issue_blocked_by_non_terminal?(_issue, _queued_states, _terminal_states), do: false
+
+  defp queued_issue_state?(state_name, queued_states) when is_binary(state_name) do
+    MapSet.member?(queued_states, normalize_issue_state(state_name))
+  end
+
+  defp queued_issue_state?(_state_name, _queued_states), do: false
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
     MapSet.member?(terminal_states, normalize_issue_state(state_name))
@@ -807,33 +829,65 @@ defmodule CymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
+  defp queued_state_set(%State{} = state) do
+    normalized_state_set(state_config(state).tracker.queued_states)
+  end
+
+  defp queued_state_set do
+    normalized_state_set(load_config().tracker.queued_states)
+  end
+
+  # No catch-all clause: the schema always casts these to a list of strings,
+  # and a second clause returning an empty set makes the union of return types
+  # break MapSet's opacity for dialyzer.
+  defp normalized_state_set(states) when is_list(states) do
+    states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.filter(&(&1 != ""))
+    |> MapSet.new()
+  end
+
   defp transition_to_in_progress(%Issue{} = issue, %State{config: nil}) do
     transition_to_in_progress(issue)
   end
 
-  defp transition_to_in_progress(%Issue{} = issue, %State{config: config}) do
-    if normalize_issue_state(issue.state || "") == "todo" do
-      case Tracker.update_issue_state(issue.id, "In Progress", config) do
-        :ok ->
-          Logger.info("Transitioned issue to In Progress: #{issue_context(issue)}")
-
-        {:error, reason} ->
-          Logger.warning("Failed to transition issue to In Progress: #{issue_context(issue)} reason=#{inspect(reason)}")
-      end
-    end
+  defp transition_to_in_progress(%Issue{} = issue, %State{config: config} = state) do
+    do_transition_to_in_progress(
+      issue,
+      queued_state_set(state),
+      config.tracker.in_progress_state,
+      &Tracker.update_issue_state(&1, &2, config)
+    )
   end
 
   defp transition_to_in_progress(%Issue{} = issue) do
-    if normalize_issue_state(issue.state || "") == "todo" do
-      case Tracker.update_issue_state(issue.id, "In Progress") do
+    tracker = load_config().tracker
+
+    do_transition_to_in_progress(
+      issue,
+      queued_state_set(),
+      tracker.in_progress_state,
+      &Tracker.update_issue_state/2
+    )
+  end
+
+  # Both the queued states and the target state are the tracker's vocabulary,
+  # so both are config. A blank `in_progress_state` skips the write entirely —
+  # a workflow with no such state should not have every dispatch log a failure.
+  defp do_transition_to_in_progress(%Issue{} = issue, queued_states, in_progress_state, update_fun)
+       when is_binary(in_progress_state) and in_progress_state != "" do
+    if queued_issue_state?(issue.state || "", queued_states) do
+      case update_fun.(issue.id, in_progress_state) do
         :ok ->
-          Logger.info("Transitioned issue to In Progress: #{issue_context(issue)}")
+          Logger.info("Transitioned issue to #{in_progress_state}: #{issue_context(issue)}")
 
         {:error, reason} ->
-          Logger.warning("Failed to transition issue to In Progress: #{issue_context(issue)} reason=#{inspect(reason)}")
+          Logger.warning("Failed to transition issue to #{in_progress_state}: #{issue_context(issue)} reason=#{inspect(reason)}")
       end
     end
   end
+
+  defp do_transition_to_in_progress(_issue, _queued_states, _in_progress_state, _update_fun), do: :ok
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, opts \\ []) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids(&1, state.config), terminal_state_set(state)) do
@@ -1240,7 +1294,7 @@ defmodule CymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 
-      retry_candidate_issue?(issue, active_state_set(state), terminal_states) ->
+      retry_candidate_issue?(issue, active_state_set(state), queued_state_set(state), terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
 
       true ->
@@ -1333,7 +1387,7 @@ defmodule CymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(%State{} = state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, active_state_set(state), terminal_state_set(state)) and
+    if retry_candidate_issue?(issue, active_state_set(state), queued_state_set(state), terminal_state_set(state)) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
       {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host], failures: metadata[:failures] || 0)}
@@ -2346,14 +2400,14 @@ defmodule CymphonyElixir.Orchestrator do
     Agent.put_section(config, kind, %{section | provider: provider, providers: providers})
   end
 
-  defp retry_candidate_issue?(%Issue{} = issue, active_states, terminal_states) do
+  defp retry_candidate_issue?(%Issue{} = issue, active_states, queued_states, terminal_states) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+      !queued_issue_blocked_by_non_terminal?(issue, queued_states, terminal_states)
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+      !queued_issue_blocked_by_non_terminal?(issue, queued_state_set(), terminal_states)
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

@@ -1331,7 +1331,7 @@ defmodule CymphonyElixirWeb.DashboardLive do
                   <input id="add-project-name" type="text" name="name" value={@add_project_name} phx-debounce="400" class="settings-field" />
                 </label>
                 <label class="settings-field-row" for="add-project-github">
-                  <span class="inline-label">github</span>
+                  <span class="inline-label">repo</span>
                   <input id="add-project-github" type="text" name="github_repo_url" value={@add_project_github} phx-debounce="400" class="settings-field" />
                 </label>
               </div>

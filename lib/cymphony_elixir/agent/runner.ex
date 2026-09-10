@@ -14,6 +14,25 @@ defmodule CymphonyElixir.Agent.Runner do
   alias CymphonyElixir.{Agent, Config, PathSafety, SSH, Text}
   alias CymphonyElixir.Cymphony.ShellProvider
   alias CymphonyElixir.Mcp.ConfigWriter
+  alias CymphonyElixir.YouTrack.Client, as: YouTrackClient
+
+  # Inherited from the daemon's environment. `gh` reads the first two, `glab`
+  # the next two, and `GITLAB_HOST` points `glab` at a self-hosted instance
+  # instead of gitlab.com.
+  #
+  # `SSH_AUTH_SOCK` is here because the agent runs `git push` itself: workspace
+  # hooks inherit the daemon's full environment (`System.cmd("sh", …)`), so an
+  # SSH clone works, but the agent's own port gets this curated env only — and
+  # without the agent socket a passphrase-protected key cannot sign, so the
+  # clone succeeds and the push fails.
+  @passthrough_env [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "GLAB_TOKEN",
+    "GITLAB_HOST",
+    "SSH_AUTH_SOCK"
+  ]
 
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
@@ -308,17 +327,56 @@ defmodule CymphonyElixir.Agent.Runner do
 
   defp provider_env(_provider_name, _agent_module), do: %{}
 
+  # Inherited env first, config second: a value the operator put in
+  # `config.json` must win over whatever happened to be exported in the shell
+  # that started the daemon, the same way `tracker.api_key` does.
   defp integration_auth_env(config) do
-    %{}
+    @passthrough_env
+    |> inherited_env()
     |> maybe_put_env("LINEAR_API_KEY", linear_api_key(config))
-    |> Map.merge(inherited_env(["GH_TOKEN", "GITHUB_TOKEN"]))
+    |> Map.merge(youtrack_env(config))
+    |> Map.merge(forge_env(config))
   end
+
+  # The agent drives `glab`/`gh` itself, so it needs the forge credential in
+  # its own (curated) environment under the names those CLIs read.
+  defp forge_env(%{forge: "gitlab"} = config) do
+    %{}
+    |> maybe_put_env("GITLAB_TOKEN", Map.get(config, :forge_token))
+    |> maybe_put_env("GLAB_TOKEN", Map.get(config, :forge_token))
+    |> maybe_put_env("GITLAB_HOST", Map.get(config, :forge_host))
+  end
+
+  defp forge_env(%{forge: _} = config) do
+    %{}
+    |> maybe_put_env("GH_TOKEN", Map.get(config, :forge_token))
+    |> maybe_put_env("GITHUB_TOKEN", Map.get(config, :forge_token))
+  end
+
+  defp forge_env(_config), do: %{}
 
   defp linear_api_key(%{tracker: %{kind: "linear", api_key: api_key}})
        when is_binary(api_key) and api_key != "",
        do: api_key
 
   defp linear_api_key(_config), do: nil
+
+  # The orchestrator owns state transitions, but the agent still reads and
+  # comments on its own issue, so it needs the same credentials the poller
+  # uses. Mirrors the Linear key injection above.
+  defp youtrack_env(%{tracker: %{kind: "youtrack"} = tracker}) do
+    %{}
+    |> maybe_put_env("YOUTRACK_TOKEN", tracker.api_key)
+    |> maybe_put_env("YOUTRACK_URL", youtrack_instance_url(tracker.endpoint))
+    |> maybe_put_env("YOUTRACK_PROJECT", tracker.project_slug)
+  end
+
+  defp youtrack_env(_config), do: %{}
+
+  defp youtrack_instance_url(endpoint) when is_binary(endpoint) and endpoint != "",
+    do: YouTrackClient.instance_base(endpoint)
+
+  defp youtrack_instance_url(_endpoint), do: nil
 
   defp inherited_env(names) when is_list(names) do
     Enum.reduce(names, %{}, fn name, env ->

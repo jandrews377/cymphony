@@ -131,6 +131,39 @@ defmodule CymphonyElixir.ConfigSchemaTest do
     assert Schema.ExtraArgs.dump(["--x"]) == {:ok, ["--x"]}
   end
 
+  test "Forge casts the known platforms, case- and whitespace-insensitively" do
+    assert Schema.Forge.type() == :string
+    assert Schema.Forge.kinds() == ["github", "gitlab"]
+    assert Schema.Forge.cast("github") == {:ok, "github"}
+    assert Schema.Forge.cast("gitlab") == {:ok, "gitlab"}
+    assert Schema.Forge.cast("  GitLab  ") == {:ok, "gitlab"}
+    assert Schema.Forge.cast(nil) == {:ok, nil}
+    assert Schema.Forge.cast("") == {:ok, nil}
+    assert Schema.Forge.cast("   ") == {:ok, nil}
+  end
+
+  test "Forge treats an unknown platform as unset instead of failing Schema.parse/1" do
+    # Same philosophy as LenientBoolean: a typo must not take the project down.
+    # `finalize_settings/1` turns the resulting nil back into the default.
+    for bad <- ["bitbucket", "gitea", :gitlab, 7, %{}] do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Schema.Forge.cast(bad) == {:ok, nil}
+        end)
+
+      assert log =~ "Ignoring unknown forge"
+    end
+
+    assert {:ok, %Schema{forge: "github"}} = Schema.parse(%{"forge" => "bitbucket"})
+    assert {:ok, %Schema{forge: "github"}} = Schema.parse(%{})
+    assert {:ok, %Schema{forge: "gitlab"}} = Schema.parse(%{"forge" => "gitlab"})
+  end
+
+  test "Forge load/dump round-trip the value unchanged" do
+    assert Schema.Forge.load("gitlab") == {:ok, "gitlab"}
+    assert Schema.Forge.dump("github") == {:ok, "github"}
+  end
+
   test "LenientBoolean casts real booleans and Ecto's string spellings" do
     assert Schema.LenientBoolean.type() == :boolean
     assert Schema.LenientBoolean.cast(true) == {:ok, true}

@@ -6,6 +6,7 @@ defmodule CymphonyElixir.TrackerTest do
   alias CymphonyElixir.Linear.Issue
   alias CymphonyElixir.Tracker
   alias CymphonyElixir.Tracker.Memory
+  alias CymphonyElixir.YouTrack.Adapter, as: YouTrackAdapter
 
   setup do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "In Progress"}
@@ -23,11 +24,15 @@ defmodule CymphonyElixir.TrackerTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert Tracker.adapter() == Adapter
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "youtrack")
+    assert Tracker.adapter() == YouTrackAdapter
   end
 
   test "adapter/1 follows the given config tracker kind" do
     assert Tracker.adapter(memory_config()) == Memory
     assert Tracker.adapter(linear_config()) == Adapter
+    assert Tracker.adapter(youtrack_config()) == YouTrackAdapter
     assert Tracker.adapter(%Schema{}) == Adapter
   end
 
@@ -53,6 +58,11 @@ defmodule CymphonyElixir.TrackerTest do
     assert :ok = Tracker.update_issue_state("issue-1", "In Review", config)
     assert_receive {:memory_tracker_comment, "issue-1", "config comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "In Review"}
+  end
+
+  defp youtrack_config do
+    {:ok, config} = Schema.parse(%{"tracker" => %{"kind" => "youtrack"}})
+    config
   end
 
   defp memory_config do

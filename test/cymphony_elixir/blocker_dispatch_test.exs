@@ -63,4 +63,35 @@ defmodule CymphonyElixir.BlockerDispatchTest do
     issue = issue("Todo", [])
     assert Orchestrator.should_dispatch_issue_for_test(issue, seed_state())
   end
+
+  describe "tracker.queued_states" do
+    # The state that means "queued" is the tracker's word: YouTrack's stock
+    # workflow calls it Open. The gate has to follow the config, or a
+    # non-Linear workflow dispatches straight past its blockers.
+    setup do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_queued_states: ["Open"],
+        tracker_active_states: ["Open", "In Progress"],
+        tracker_terminal_states: ["Fixed", "Verified"]
+      )
+
+      if Process.whereis(WorkflowStore), do: WorkflowStore.force_reload()
+      :ok
+    end
+
+    test "the configured queued state is gated on its blockers" do
+      blocked = issue("Open", [%{id: "b1", identifier: "MT-1", state: "In Progress"}])
+      refute Orchestrator.should_dispatch_issue_for_test(blocked, seed_state())
+
+      unblocked = issue("Open", [%{id: "b1", identifier: "MT-1", state: "Fixed"}])
+      assert Orchestrator.should_dispatch_issue_for_test(unblocked, seed_state())
+    end
+
+    test "Todo is no longer gated once it is not a queued state" do
+      # Not an active state in this workflow either, so it is not dispatched —
+      # what matters is that the gate itself has moved to `Open`.
+      in_progress = issue("In Progress", [%{id: "b1", identifier: "MT-1", state: "In Progress"}])
+      assert Orchestrator.should_dispatch_issue_for_test(in_progress, seed_state())
+    end
+  end
 end

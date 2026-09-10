@@ -103,22 +103,37 @@ defmodule CymphonyElixir.Config do
     validate_semantics(settings)
   end
 
+  # `Schema` defaults `tracker.endpoint` to Linear's GraphQL URL, so a
+  # hand-authored YouTrack workflow that omits the instance URL would otherwise
+  # send a YouTrack token to api.linear.app. Treat the Linear default as
+  # "no YouTrack URL configured".
+  @linear_default_endpoint "https://api.linear.app/graphql"
+
   defp validate_semantics(settings) do
+    case settings.tracker.kind do
+      nil -> {:error, :missing_tracker_kind}
+      "memory" -> :ok
+      "linear" -> validate_linear_tracker(settings.tracker)
+      "youtrack" -> validate_youtrack_tracker(settings.tracker)
+      kind -> {:error, {:unsupported_tracker_kind, kind}}
+    end
+  end
+
+  defp validate_linear_tracker(tracker) do
     cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
+      not is_binary(tracker.api_key) -> {:error, :missing_linear_api_token}
+      not is_binary(tracker.project_slug) -> {:error, :missing_linear_project_slug}
+      true -> :ok
+    end
+  end
 
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      true ->
-        :ok
+  defp validate_youtrack_tracker(tracker) do
+    cond do
+      not is_binary(tracker.api_key) -> {:error, :missing_youtrack_token}
+      not is_binary(tracker.endpoint) -> {:error, :missing_youtrack_url}
+      tracker.endpoint == @linear_default_endpoint -> {:error, :missing_youtrack_url}
+      not is_binary(tracker.project_slug) -> {:error, :missing_youtrack_project}
+      true -> :ok
     end
   end
 

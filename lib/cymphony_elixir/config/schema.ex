@@ -84,6 +84,51 @@ defmodule CymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Forge do
+    @moduledoc false
+    # Which code-hosting platform the repository lives on. Drives the prompt's
+    # vocabulary and CLI (`gh` + pull request vs `glab` + merge request) and
+    # the SSH -> HTTPS clone-URL rewrite. Same philosophy as `LenientBoolean`:
+    # an unrecognized value is logged and treated as unset rather than failing
+    # `Schema.parse/1` and taking the project down over a typo.
+    use Ecto.Type
+
+    require Logger
+
+    @kinds ["github", "gitlab"]
+
+    @spec kinds() :: [String.t()]
+    def kinds, do: @kinds
+
+    @impl true
+    def type, do: :string
+
+    @impl true
+    def cast(nil), do: {:ok, nil}
+
+    def cast(value) when is_binary(value) do
+      case value |> String.trim() |> String.downcase() do
+        "" -> {:ok, nil}
+        kind when kind in @kinds -> {:ok, kind}
+        _ -> ignore(value)
+      end
+    end
+
+    def cast(value), do: ignore(value)
+
+    @impl true
+    def load(value), do: {:ok, value}
+
+    @impl true
+    def dump(value), do: {:ok, value}
+
+    defp ignore(value) do
+      Logger.warning("Ignoring unknown forge in workflow config (expected one of #{Enum.join(@kinds, ", ")}), got #{inspect(value)}")
+
+      {:ok, nil}
+    end
+  end
+
   defmodule Tracker do
     @moduledoc false
     use Ecto.Schema
@@ -97,6 +142,28 @@ defmodule CymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      # YouTrack keeps the workflow state in a *custom field*, and projects
+      # rename it: the stock name is "State", but "Stage" is just as common.
+      # Reading the wrong name yields `state: nil`, which silently never
+      # dispatches, so it has to be configurable rather than assumed.
+      field(:state_field, :string, default: "State")
+      # The subset of `active_states` that means "queued, not started". The
+      # dispatch transition and the blocker gate key off these, so a tracker
+      # whose workflow does not use the word "Todo" (YouTrack ships
+      # Open/In Progress/Fixed) can still be driven without renaming its
+      # states. Defaults keep Linear's vocabulary.
+      field(:queued_states, {:array, :string}, default: ["Todo"])
+      # State to move an issue to when a run is dispatched. `nil`/blank skips
+      # the transition entirely.
+      field(:in_progress_state, :string, default: "In Progress")
+      # Where the agent hands work to a human once the change is published.
+      # Must NOT be in `active_states`, or agents re-dispatch onto issues that
+      # are waiting on a reviewer.
+      field(:review_state, :string, default: "Human Review")
+      # The state meaning "approved, go merge". Blank means humans merge and
+      # the agent's job ends at `review_state`; the prompt then omits the whole
+      # land/merge protocol.
+      field(:merge_state, :string, default: "Merging")
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -106,7 +173,20 @@ defmodule CymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :assignee,
+          :state_field,
+          :queued_states,
+          :in_progress_state,
+          :review_state,
+          :merge_state,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
     end
@@ -231,7 +311,14 @@ defmodule CymphonyElixir.Config.Schema do
     embedded_schema do
       field(:command, :string, default: "claude")
       field(:permission_mode, :string, default: "acceptEdits")
-      field(:allowed_tools, :string, default: "Bash,Read,Edit")
+      # Wider than the work-limiting `Bash,Read,Edit` this used to be: the
+      # prompt asks the agent to create files and update its ticket, and under
+      # headless `-p` an ungranted tool is not a prompt but a
+      # `permission_denied`. Generated projects override this with a
+      # tracker-aware list (`Cymphony.Defaults.claude_allowed_tools/1`); the
+      # default here is for hand-authored WORKFLOW.md files, which cannot be
+      # tracker-aware.
+      field(:allowed_tools, :string, default: "Bash,Read,Edit,Write,Glob,Grep")
       field(:output_format, :string, default: "stream-json")
       field(:fallback_model, :string)
       field(:max_turns, :integer)
@@ -404,6 +491,23 @@ defmodule CymphonyElixir.Config.Schema do
   end
 
   embedded_schema do
+    # Top-level rather than a section of its own: one repository has one forge,
+    # and both the prompt and the clone hook need it.
+    field(:forge, Forge, default: "github")
+    # Branch the agent creates for a run. A Liquid template rendered against
+    # the issue, so `{{ issue.identifier }}` yields `HC-1`. Without an explicit
+    # rule the agent invents a name every run ("HC-1-hello-world-static-page"),
+    # which is neither predictable nor greppable.
+    field(:branch_name_template, :string, default: "{{ issue.identifier }}")
+    # Forge credentials, so the agent can drive `glab`/`gh`. The tracker's
+    # credential already lives in config; the forge's had been shell-env only,
+    # which meant it silently vanished whenever the daemon was started from a
+    # shell that had not exported it. May be a literal or `$VAR_NAME`; falls
+    # back to the environment variable the CLI itself reads.
+    field(:forge_token, :string)
+    # Instance host for a self-hosted forge, e.g. `gitlab.example.com`.
+    # Without it `glab` talks to gitlab.com.
+    field(:forge_host, :string)
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
@@ -469,7 +573,7 @@ defmodule CymphonyElixir.Config.Schema do
 
   defp changeset(attrs) do
     %__MODULE__{}
-    |> cast(attrs, [])
+    |> cast(attrs, [:forge, :branch_name_template, :forge_token, :forge_host], empty_values: [])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
@@ -495,7 +599,28 @@ defmodule CymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "cymphony_workspaces"))
     }
 
-    %{settings | tracker: tracker, workspace: workspace}
+    # `Forge.cast/1` maps an unrecognized value to nil (logged, not fatal), and
+    # a cast nil overwrites the field default — so the fallback lands here
+    # rather than in the field definition.
+    forge = settings.forge || "github"
+
+    # No environment fallback here, deliberately. `Agent.Runner` already
+    # inherits GH_TOKEN/GITHUB_TOKEN/GITLAB_TOKEN/GITLAB_HOST from the daemon
+    # and overlays these on top, so a nil means "whatever the environment
+    # says". Defaulting the field from the environment instead would collapse
+    # independently-exported GH_TOKEN and GITHUB_TOKEN into one value. A
+    # `$VAR_NAME` indirection still resolves.
+    forge_token = resolve_secret_setting(settings.forge_token, nil)
+    forge_host = resolve_secret_setting(settings.forge_host, nil)
+
+    %{
+      settings
+      | tracker: tracker,
+        workspace: workspace,
+        forge: forge,
+        forge_token: forge_token,
+        forge_host: forge_host
+    }
   end
 
   defp normalize_keys(value) when is_map(value) do

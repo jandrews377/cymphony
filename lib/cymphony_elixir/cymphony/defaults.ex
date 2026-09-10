@@ -9,6 +9,19 @@ defmodule CymphonyElixir.Cymphony.Defaults do
   field defaults for hand-authored `WORKFLOW.md` files that omit keys.
   """
 
+  # Only literal "Todo" — matching `Config.Schema`'s default and the behavior
+  # before the state names became configurable. "Rework" is an active state but
+  # deliberately not a queued one: making it queued would newly gate reworked
+  # issues on their blockers.
+  # GitHub, for backward compatibility: every config.json written before
+  # GitLab was supported describes a GitHub repository.
+  @forge "github"
+  @branch_name_template "{{ issue.identifier }}"
+  @queued_states ["Todo"]
+  @in_progress_state "In Progress"
+  @state_field "State"
+  @review_state "Human Review"
+  @merge_state "Merging"
   @active_states ["Todo", "In Progress", "Merging", "Rework"]
   @terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
   @max_turns 20
@@ -22,6 +35,59 @@ defmodule CymphonyElixir.Cymphony.Defaults do
   @codex_command "codex"
   @antigravity_command "agy"
   @codex_sandbox "workspace-write"
+
+  # `--allowedTools` for an autonomous headless run. The old value was
+  # `Bash,Read,Edit`, which is narrower than the work the prompt asks for: an
+  # agent told to create files, publish a branch and update its ticket was
+  # granted neither `Write` nor any tracker tool. Under `-p` there is nobody to
+  # approve the prompt, so those calls came back `permission_denied` and the
+  # run limped on through `Bash` fallbacks — extra turns, and every turn
+  # re-bills the whole prompt preamble.
+  @claude_allowed_tools ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
+  @claude_permission_mode "acceptEdits"
+
+  @doc """
+  Code-hosting platform a project's repository lives on (`github`/`gitlab`).
+  """
+  @spec forge() :: String.t()
+  def forge, do: @forge
+
+  @doc """
+  Liquid template for the branch a run creates, rendered against the issue.
+  """
+  @spec branch_name_template() :: String.t()
+  def branch_name_template, do: @branch_name_template
+
+  @doc """
+  States meaning "queued, not started" — the dispatch transition and the
+  blocker gate key off these. Mirrors `Config.Schema`'s `tracker.queued_states`.
+  """
+  @spec queued_states() :: [String.t()]
+  def queued_states, do: @queued_states
+
+  @doc """
+  State an issue is moved to when a run is dispatched.
+  """
+  @spec in_progress_state() :: String.t()
+  def in_progress_state, do: @in_progress_state
+
+  @doc """
+  Custom field holding the workflow state (YouTrack projects rename it).
+  """
+  @spec state_field() :: String.t()
+  def state_field, do: @state_field
+
+  @doc """
+  State the agent moves an issue to when it hands the change to a human.
+  """
+  @spec review_state() :: String.t()
+  def review_state, do: @review_state
+
+  @doc """
+  State meaning "approved, go merge". Blank disables the agent-merge flow.
+  """
+  @spec merge_state() :: String.t()
+  def merge_state, do: @merge_state
 
   @spec active_states() :: [String.t()]
   def active_states, do: @active_states
@@ -68,4 +134,37 @@ defmodule CymphonyElixir.Cymphony.Defaults do
 
   @spec codex_sandbox() :: String.t()
   def codex_sandbox, do: @codex_sandbox
+
+  @doc """
+  Base `--allowedTools` list for Claude, before the tracker's own tools.
+
+  A name the running CLI does not define is simply ignored by it, so listing a
+  tool that a given Claude Code version lacks is harmless.
+  """
+  @spec claude_allowed_tools() :: [String.t()]
+  def claude_allowed_tools, do: @claude_allowed_tools
+
+  @doc """
+  `--allowedTools` including the MCP server for `tracker_kind`.
+
+  The agent is required by the prompt to read and update its ticket. Linear
+  gets an MCP descriptor written into the workspace and YouTrack is commonly
+  configured globally in the operator's own `~/.claude.json`, so in both cases
+  the server exists and only the grant is missing. Naming the server without a
+  tool suffix grants all of its tools; an absent server contributes nothing.
+  """
+  @spec claude_allowed_tools(String.t() | nil) :: [String.t()]
+  def claude_allowed_tools(tracker_kind) do
+    case tracker_kind do
+      "linear" -> @claude_allowed_tools ++ ["mcp__linear"]
+      "youtrack" -> @claude_allowed_tools ++ ["mcp__youtrack"]
+      _ -> @claude_allowed_tools
+    end
+  end
+
+  @doc """
+  Claude `--permission-mode` for a generated project.
+  """
+  @spec claude_permission_mode() :: String.t()
+  def claude_permission_mode, do: @claude_permission_mode
 end

@@ -1,8 +1,12 @@
 defmodule CymphonyElixir.Cymphony.ConfigTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
+  alias CymphonyElixir.Config
   alias CymphonyElixir.Config.Schema
   alias CymphonyElixir.Cymphony.Config, as: CymphonyConfig
+  alias CymphonyElixir.Cymphony.Defaults
   alias CymphonyElixir.Cymphony.WorkflowGenerator
   alias CymphonyElixir.Workflow
 
@@ -104,6 +108,213 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       assert map["antigravity"]["skip_permissions"] == true
     end
 
+    test "keeps the Linear shape when no tracker_kind is named" do
+      map = CymphonyConfig.to_schema_map(%{"linear_api_key" => "k", "linear_project_slug" => "slug"})
+
+      assert map["tracker"]["kind"] == "linear"
+      refute Map.has_key?(map["tracker"], "endpoint")
+      refute Map.has_key?(map["tracker"], "assignee")
+      refute Map.has_key?(map, "server")
+    end
+
+    test "generates a YouTrack tracker section" do
+      map =
+        CymphonyConfig.to_schema_map(%{
+          "tracker_kind" => "youtrack",
+          "tracker_endpoint" => "  https://example.youtrack.cloud  ",
+          "tracker_api_key" => "perm:token",
+          "tracker_project_slug" => "LLM",
+          "tracker_assignee" => "jeremy"
+        })
+
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.tracker.kind == "youtrack"
+      assert parsed.tracker.endpoint == "https://example.youtrack.cloud"
+      assert parsed.tracker.api_key == "perm:token"
+      assert parsed.tracker.project_slug == "LLM"
+      assert parsed.tracker.assignee == "jeremy"
+      assert Config.validate!(parsed) == :ok
+    end
+
+    test "tracker_api_key and tracker_project_slug fall back to the linear_* keys" do
+      map =
+        CymphonyConfig.to_schema_map(%{
+          "tracker_kind" => "youtrack",
+          "tracker_endpoint" => "https://example.youtrack.cloud",
+          "linear_api_key" => "perm:legacy",
+          "linear_project_slug" => "LEG",
+          "tracker_api_key" => "",
+          "tracker_project_slug" => nil
+        })
+
+      assert map["tracker"]["api_key"] == "perm:legacy"
+      assert map["tracker"]["project_slug"] == "LEG"
+    end
+
+    test "an unknown tracker_kind falls back to linear and warns" do
+      log =
+        capture_log(fn ->
+          assert CymphonyConfig.to_schema_map(%{"tracker_kind" => "jira"})["tracker"]["kind"] == "linear"
+        end)
+
+      assert log =~ "Ignoring unknown tracker_kind"
+      assert CymphonyConfig.to_schema_map(%{"tracker_kind" => 7})["tracker"]["kind"] == "linear"
+    end
+
+    test "a project can name the state that means queued and the one dispatch moves to" do
+      map =
+        CymphonyConfig.to_schema_map(%{
+          "queued_states" => ["Open", "Submitted"],
+          "in_progress_state" => "  In Progress  "
+        })
+
+      assert map["tracker"]["queued_states"] == ["Open", "Submitted"]
+      assert map["tracker"]["in_progress_state"] == "In Progress"
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.tracker.queued_states == ["Open", "Submitted"]
+      assert parsed.tracker.in_progress_state == "In Progress"
+    end
+
+    test "forge credentials come from config and support $VAR indirection" do
+      map =
+        CymphonyConfig.to_schema_map(%{
+          "forge" => "gitlab",
+          "forge_token" => "  glpat-literal  ",
+          "forge_host" => "gitlab.example.com"
+        })
+
+      assert map["forge_token"] == "glpat-literal"
+      assert map["forge_host"] == "gitlab.example.com"
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.forge_token == "glpat-literal"
+      assert parsed.forge_host == "gitlab.example.com"
+
+      # Absent keys stay absent, so the runner's inherited environment wins.
+      plain = CymphonyConfig.to_schema_map(%{})
+      refute Map.has_key?(plain, "forge_token")
+      refute Map.has_key?(plain, "forge_host")
+      assert {:ok, %Schema{forge_token: nil, forge_host: nil}} = Schema.parse(plain)
+    end
+
+    test "a project can name the custom field holding the workflow state" do
+      # YouTrack keeps the state in a custom field and projects rename it
+      # ("Stage" is common). Reading the wrong name yields state: nil, which
+      # never matches an active state and so silently never dispatches.
+      map = CymphonyConfig.to_schema_map(%{"state_field" => "  Stage  "})
+
+      assert map["tracker"]["state_field"] == "Stage"
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.tracker.state_field == "Stage"
+
+      assert CymphonyConfig.to_schema_map(%{})["tracker"]["state_field"] == "State"
+      assert CymphonyConfig.to_schema_map(%{"state_field" => 7})["tracker"]["state_field"] == "State"
+    end
+
+    test "a project can name its review and merge states" do
+      map =
+        CymphonyConfig.to_schema_map(%{
+          "review_state" => "  Review and Testing  ",
+          "merge_state" => ""
+        })
+
+      assert map["tracker"]["review_state"] == "Review and Testing"
+      # Empty is meaningful: humans merge, and the prompt drops the land flow.
+      assert map["tracker"]["merge_state"] == ""
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.tracker.review_state == "Review and Testing"
+      assert parsed.tracker.merge_state == ""
+    end
+
+    test "review and merge states default to Linear's names" do
+      default = CymphonyConfig.to_schema_map(%{})
+
+      assert default["tracker"]["review_state"] == "Human Review"
+      assert default["tracker"]["merge_state"] == "Merging"
+      assert CymphonyConfig.to_schema_map(%{"review_state" => 7})["tracker"]["review_state"] == "Human Review"
+    end
+
+    test "queued state defaults stay Linear-shaped, and an empty in_progress_state disables the transition" do
+      default = CymphonyConfig.to_schema_map(%{})
+
+      assert default["tracker"]["queued_states"] == ["Todo"]
+      assert default["tracker"]["in_progress_state"] == "In Progress"
+      assert CymphonyConfig.to_schema_map(%{"in_progress_state" => 7})["tracker"]["in_progress_state"] == "In Progress"
+
+      # An explicit empty string is meaningful: no such state in the workflow.
+      assert CymphonyConfig.to_schema_map(%{"in_progress_state" => ""})["tracker"]["in_progress_state"] == ""
+    end
+
+    test "a project can name its own active and terminal states" do
+      map =
+        CymphonyConfig.to_schema_map(%{
+          "active_states" => ["Open", " In Progress ", "In Progress", ""],
+          "terminal_states" => ["Fixed", "Verified"]
+        })
+
+      assert map["tracker"]["active_states"] == ["Open", "In Progress"]
+      assert map["tracker"]["terminal_states"] == ["Fixed", "Verified"]
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.tracker.active_states == ["Open", "In Progress"]
+    end
+
+    test "an invalid state list warns and keeps the default" do
+      # A mistyped list either polls nothing or treats finished work as
+      # running, so it must never reach the front matter silently.
+      for bad <- ["Open", ["Open", 1], [], ["   "], %{"a" => "b"}, 7] do
+        log =
+          capture_log(fn ->
+            map = CymphonyConfig.to_schema_map(%{"active_states" => bad})
+            assert map["tracker"]["active_states"] == ["Todo", "In Progress", "Merging", "Rework"]
+          end)
+
+        assert log =~ "Ignoring invalid active_states"
+      end
+
+      default = CymphonyConfig.to_schema_map(%{})
+      assert default["tracker"]["active_states"] == ["Todo", "In Progress", "Merging", "Rework"]
+      assert default["tracker"]["terminal_states"] == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    end
+
+    test "only an explicit false disables claude bare mode" do
+      # `--bare` skips keychain reads, so a Claude Code account (as opposed to
+      # an API key) cannot authenticate under it.
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{})["claude"], "bare_mode")
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"claude_bare_mode" => true})["claude"], "bare_mode")
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"claude_bare_mode" => "false"})["claude"], "bare_mode")
+
+      map = CymphonyConfig.to_schema_map(%{"claude_bare_mode" => false})
+
+      assert map["claude"]["bare_mode"] == false
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      refute parsed.claude.bare_mode
+      assert Schema.parse(CymphonyConfig.to_schema_map(%{})) |> elem(1) |> then(& &1.claude.bare_mode)
+    end
+
+    test "only an explicit false disables the status TUI" do
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{}), "observability")
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"status_dashboard_enabled" => true}), "observability")
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"status_dashboard_enabled" => "false"}), "observability")
+
+      map = CymphonyConfig.to_schema_map(%{"status_dashboard_enabled" => false})
+
+      assert map["observability"] == %{"dashboard_enabled" => false}
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      refute parsed.observability.dashboard_enabled
+    end
+
+    test "emits a server section only when a host or port is configured" do
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"server_host" => "  "}), "server")
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"server_port" => "4000"}), "server")
+      refute Map.has_key?(CymphonyConfig.to_schema_map(%{"server_port" => -1}), "server")
+
+      map = CymphonyConfig.to_schema_map(%{"server_host" => "0.0.0.0", "server_port" => 4000})
+
+      assert map["server"] == %{"host" => "0.0.0.0", "port" => 4000}
+      assert {:ok, %Schema{} = parsed} = Schema.parse(map)
+      assert parsed.server.host == "0.0.0.0"
+      assert parsed.server.port == 4000
+    end
+
     test "explicit values override defaults" do
       map =
         CymphonyConfig.to_schema_map(%{
@@ -166,12 +377,76 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       refute Map.has_key?(CymphonyConfig.to_schema_map(%{"github_repo_url" => 1}), "hooks")
     end
 
-    test "github_repo_url that is not an scp-style git@ remote is cloned verbatim" do
+    test "a repo URL that is not an scp-style git@ remote is cloned verbatim" do
       https = CymphonyConfig.to_schema_map(%{"github_repo_url" => "  https://github.com/me/repo.git  "})
       assert https["hooks"]["after_create"] == "git clone --depth 1 https://github.com/me/repo.git .\n"
 
-      other_host = CymphonyConfig.to_schema_map(%{"github_repo_url" => "git@gitlab.com:me/repo.git"})
-      assert other_host["hooks"]["after_create"] =~ "git clone --depth 1 git@gitlab.com:me/repo.git"
+      ssh_url = CymphonyConfig.to_schema_map(%{"repo_url" => "ssh://git@gitlab.example.com/group/repo.git"})
+      assert ssh_url["hooks"]["after_create"] =~ "git clone --depth 1 ssh://git@gitlab.example.com/group/repo.git"
+    end
+
+    test "the scp-style rewrite is host-agnostic, so GitLab clones over HTTPS too" do
+      # An SSH remote in a container has no key; HTTPS picks up the gh/glab
+      # credential helper. Nested groups are a GitLab shape the old
+      # github.com-only regex could not express.
+      for {remote, https} <- [
+            {"git@gitlab.com:me/repo.git", "https://gitlab.com/me/repo.git"},
+            {"git@gitlab.example.com:group/subgroup/repo.git", "https://gitlab.example.com/group/subgroup/repo.git"},
+            {"git@gitlab.com:me/repo", "https://gitlab.com/me/repo.git"}
+          ] do
+        assert CymphonyConfig.https_clone_url(remote) == https
+        assert CymphonyConfig.to_schema_map(%{"repo_url" => remote})["hooks"]["after_create"] =~ https
+      end
+    end
+
+    test "rewrite_ssh_remote: false clones the remote exactly as written" do
+      # Running as the invoker (rootless podman mounts ~/.ssh and the agent
+      # socket) makes an SSH remote workable, and forcing HTTPS would demand a
+      # token the operator may not have.
+      ssh = %{"repo_url" => "git@gitlab.example.com:group/sub/repo.git", "rewrite_ssh_remote" => false}
+
+      assert CymphonyConfig.to_schema_map(ssh)["hooks"]["after_create"] ==
+               "git clone --depth 1 git@gitlab.example.com:group/sub/repo.git .\n"
+
+      # Only an explicit false opts out.
+      for keep <- [true, "false", nil, 0] do
+        map = CymphonyConfig.to_schema_map(Map.put(ssh, "rewrite_ssh_remote", keep))
+        assert map["hooks"]["after_create"] =~ "https://gitlab.example.com/group/sub/repo.git"
+      end
+    end
+
+    test "repo_url wins over the legacy github_repo_url key" do
+      assert CymphonyConfig.repo_url(%{"repo_url" => " https://gitlab.com/a/b.git "}) == "https://gitlab.com/a/b.git"
+      assert CymphonyConfig.repo_url(%{"github_repo_url" => "https://github.com/a/b.git"}) == "https://github.com/a/b.git"
+
+      both = %{"repo_url" => "https://gitlab.com/a/b.git", "github_repo_url" => "https://github.com/a/b.git"}
+      assert CymphonyConfig.repo_url(both) == "https://gitlab.com/a/b.git"
+
+      assert CymphonyConfig.repo_url(%{"repo_url" => "  ", "github_repo_url" => "https://github.com/a/b.git"}) ==
+               "https://github.com/a/b.git"
+
+      assert CymphonyConfig.repo_url(%{}) == ""
+      assert CymphonyConfig.repo_url(%{"repo_url" => 1}) == ""
+    end
+
+    test "project_slug/1 prefers the tracker key and falls back to the Linear one" do
+      assert CymphonyConfig.project_slug(%{"tracker_project_slug" => " DEMO "}) == "DEMO"
+      assert CymphonyConfig.project_slug(%{"linear_project_slug" => "lin"}) == "lin"
+      assert CymphonyConfig.project_slug(%{"tracker_project_slug" => "yt", "linear_project_slug" => "lin"}) == "yt"
+      assert CymphonyConfig.project_slug(%{"tracker_project_slug" => "  ", "linear_project_slug" => "lin"}) == "lin"
+      assert CymphonyConfig.project_slug(%{}) == ""
+      assert CymphonyConfig.project_slug(%{"tracker_project_slug" => 1}) == ""
+    end
+
+    test "forge defaults to github and only a known value overrides it" do
+      assert CymphonyConfig.to_schema_map(%{})["forge"] == "github"
+      assert CymphonyConfig.to_schema_map(%{"forge" => " GitLab "})["forge"] == "gitlab"
+      assert {:ok, %Schema{forge: "gitlab"}} = Schema.parse(CymphonyConfig.to_schema_map(%{"forge" => "gitlab"}))
+
+      for bad <- ["bitbucket", "", 7, nil] do
+        log = capture_log(fn -> assert CymphonyConfig.to_schema_map(%{"forge" => bad})["forge"] == "github" end)
+        if bad != nil, do: assert(log =~ "Ignoring unknown forge")
+      end
     end
   end
 
@@ -377,6 +652,76 @@ defmodule CymphonyElixir.Cymphony.ConfigTest do
       assert {:ok, %{config: parsed_map}} = Workflow.load(path)
       assert {:ok, %Schema{} = settings} = Schema.parse(parsed_map)
       assert settings.agent.stall_timeout_ms == 1_800_000
+    end
+  end
+
+  describe "to_schema_map/1 allowed_tools" do
+    # An autonomous run has nobody to approve a permission prompt, so a tool
+    # the prompt requires but the grant omits comes back `permission_denied`
+    # and the agent works around it with shell — costing turns, and every turn
+    # re-bills the whole prompt preamble.
+    test "grants the tracker's MCP server alongside the file and shell tools" do
+      youtrack = CymphonyConfig.to_schema_map(%{"tracker_kind" => "youtrack"})
+      linear = CymphonyConfig.to_schema_map(%{"tracker_kind" => "linear"})
+
+      assert youtrack["claude"]["allowed_tools"] ==
+               "Bash,Read,Edit,Write,Glob,Grep,mcp__youtrack"
+
+      assert linear["claude"]["allowed_tools"] == "Bash,Read,Edit,Write,Glob,Grep,mcp__linear"
+    end
+
+    test "grants Write, which the old Bash,Read,Edit default withheld" do
+      map = CymphonyConfig.to_schema_map(%{})
+
+      assert map["claude"]["allowed_tools"] =~ "Write"
+      assert map["claude"]["permission_mode"] == "acceptEdits"
+    end
+
+    test "an unrecognized tracker_kind still resolves to linear's grant" do
+      # tracker_kind/1 warns and falls back to "linear", so the grant follows
+      # the tracker that will actually be polled.
+      map = CymphonyConfig.to_schema_map(%{"tracker_kind" => "memory"})
+
+      assert map["claude"]["allowed_tools"] == "Bash,Read,Edit,Write,Glob,Grep,mcp__linear"
+    end
+
+    test "Defaults.claude_allowed_tools/1 adds no MCP grant for a tracker without one" do
+      assert Defaults.claude_allowed_tools(nil) == Defaults.claude_allowed_tools()
+      assert Defaults.claude_allowed_tools("memory") == Defaults.claude_allowed_tools()
+      refute Enum.any?(Defaults.claude_allowed_tools("memory"), &String.starts_with?(&1, "mcp__"))
+    end
+
+    test "an operator override wins, as a list or a comma-separated string" do
+      list = CymphonyConfig.to_schema_map(%{"allowed_tools" => ["Bash", "mcp__jira"]})
+      string = CymphonyConfig.to_schema_map(%{"allowed_tools" => "Bash,mcp__jira"})
+
+      assert list["claude"]["allowed_tools"] == "Bash,mcp__jira"
+      assert string["claude"]["allowed_tools"] == "Bash,mcp__jira"
+    end
+
+    test "a malformed override falls back to the default rather than emitting junk" do
+      for bad <- [42, %{"a" => 1}, ["Bash", 7], ""] do
+        map = CymphonyConfig.to_schema_map(%{"allowed_tools" => bad, "tracker_kind" => "youtrack"})
+
+        assert map["claude"]["allowed_tools"] ==
+                 "Bash,Read,Edit,Write,Glob,Grep,mcp__youtrack"
+      end
+    end
+
+    test "permission_mode is overridable and survives a round trip through Schema" do
+      map = CymphonyConfig.to_schema_map(%{"permission_mode" => "bypassPermissions"})
+
+      assert map["claude"]["permission_mode"] == "bypassPermissions"
+      assert {:ok, %Schema{} = settings} = Schema.parse(map)
+      assert settings.claude.permission_mode == "bypassPermissions"
+      assert settings.claude.allowed_tools =~ "Write"
+    end
+
+    test "a malformed permission_mode falls back instead of failing Schema.parse/1" do
+      map = CymphonyConfig.to_schema_map(%{"permission_mode" => 7})
+
+      assert map["claude"]["permission_mode"] == "acceptEdits"
+      assert {:ok, %Schema{}} = Schema.parse(map)
     end
   end
 end

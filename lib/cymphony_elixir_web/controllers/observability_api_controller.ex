@@ -418,6 +418,10 @@ defmodule CymphonyElixirWeb.ObservabilityApiController do
     [
       "name",
       "linear_project_slug",
+      # `repo_url` is the current key; `github_repo_url` predates GitLab
+      # support and is still accepted (and still what the dashboard form
+      # posts), so existing clients and config files keep working.
+      "repo_url",
       "github_repo_url",
       "workspace_root",
       "agent",

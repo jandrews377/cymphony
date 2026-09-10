@@ -114,11 +114,16 @@ defmodule CymphonyElixir.TestSupport do
     config =
       Keyword.merge(
         [
+          forge: nil,
+          forge_token: nil,
+          forge_host: nil,
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
           tracker_project_slug: "project",
           tracker_assignee: nil,
+          tracker_queued_states: ["Todo"],
+          tracker_in_progress_state: "In Progress",
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
@@ -169,11 +174,16 @@ defmodule CymphonyElixir.TestSupport do
         overrides
       )
 
+    forge = Keyword.get(config, :forge)
+    forge_token = Keyword.get(config, :forge_token)
+    forge_host = Keyword.get(config, :forge_host)
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
+    tracker_queued_states = Keyword.get(config, :tracker_queued_states)
+    tracker_in_progress_state = Keyword.get(config, :tracker_in_progress_state)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
@@ -224,12 +234,17 @@ defmodule CymphonyElixir.TestSupport do
     sections =
       [
         "---",
+        "forge: #{yaml_value(forge)}",
+        "forge_token: #{yaml_value(forge_token)}",
+        "forge_host: #{yaml_value(forge_host)}",
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
+        "  queued_states: #{yaml_value(tracker_queued_states)}",
+        "  in_progress_state: #{yaml_value(tracker_in_progress_state)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",

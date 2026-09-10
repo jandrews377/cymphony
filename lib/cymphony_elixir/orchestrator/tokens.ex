@@ -48,12 +48,12 @@ defmodule CymphonyElixir.Orchestrator.Tokens do
   @spec extract_token_delta(map() | nil, map()) :: token_delta()
   def extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
     running_entry = running_entry || %{}
-    usage = extract_token_usage(update)
+    {mode, usage} = extract_token_usage(update)
 
     {
-      compute_token_delta(running_entry, :input, usage, :last_reported_input_tokens),
-      compute_token_delta(running_entry, :output, usage, :last_reported_output_tokens),
-      compute_token_delta(running_entry, :total, usage, :last_reported_total_tokens)
+      compute_token_delta(running_entry, :input, usage, :last_reported_input_tokens, mode),
+      compute_token_delta(running_entry, :output, usage, :last_reported_output_tokens, mode),
+      compute_token_delta(running_entry, :total, usage, :last_reported_total_tokens, mode)
     }
     |> Tuple.to_list()
     |> then(fn [input, output, total] ->
@@ -84,7 +84,28 @@ defmodule CymphonyElixir.Orchestrator.Tokens do
 
   def extract_rate_limits(_update), do: nil
 
-  defp compute_token_delta(running_entry, token_key, usage, reported_key) do
+  # Two shapes reach this, and telling them apart is the whole game.
+  #
+  #   * `:absolute` — a cumulative running total for the session, which is what
+  #     a `result` / `turn.completed` event reports. The delta is the rise since
+  #     the last report, and a value that went *down* is a stale or partial
+  #     frame, so it contributes nothing.
+  #   * `:additive` — the cost of one message, which is what Claude's
+  #     per-`assistant` `message.usage` reports. Diffing those is meaningless:
+  #     the field sits at 2, 2, 2 across a whole run and never rises, so the
+  #     monotonic rule above scored every turn as zero. It is summed instead,
+  #     and the running sum is written back as `reported` so a later absolute
+  #     frame (the final `result`) diffs against what has already been counted
+  #     and lands only the correction, rather than double-counting the session.
+  defp compute_token_delta(running_entry, token_key, usage, reported_key, :additive) do
+    amount = get_token_usage(usage, token_key)
+    prev_reported = Map.get(running_entry, reported_key, 0)
+    delta = if is_integer(amount), do: max(amount, 0), else: 0
+
+    %{delta: delta, reported: prev_reported + delta}
+  end
+
+  defp compute_token_delta(running_entry, token_key, usage, reported_key, _absolute) do
     next_total = get_token_usage(usage, token_key)
     prev_reported = Map.get(running_entry, reported_key, 0)
 
@@ -103,21 +124,60 @@ defmodule CymphonyElixir.Orchestrator.Tokens do
 
   # First integer_token_map among: (a) update[:usage]/update["usage"],
   # (b) payload["usage"], (c) type=="turn.completed", (d) event=="result",
-  # (e) event=="step_update", (f) existing Claude nested paths.
+  # (e) event=="step_update", (f) Claude's per-message `message.usage`,
+  # (g) existing Claude nested paths.
+  #
+  # Returns the mode alongside the map, because (f) is a per-message amount
+  # while every other shape is a session-cumulative total. See
+  # `compute_token_delta/5`.
   defp extract_token_usage(update) do
     payload = update[:payload] || Map.get(update, "payload")
 
-    [
-      integer_token_map_or_nil(update[:usage]),
-      integer_token_map_or_nil(Map.get(update, "usage")),
-      integer_token_map_or_nil(payload_usage_field(payload)),
-      typed_turn_completed_usage(payload),
-      result_event_usage(payload),
-      step_update_usage(payload),
-      claude_usage_from_update(update, payload)
-    ]
-    |> Enum.find(&is_map/1) || %{}
+    absolute =
+      [
+        integer_token_map_or_nil(update[:usage]),
+        integer_token_map_or_nil(Map.get(update, "usage")),
+        integer_token_map_or_nil(payload_usage_field(payload)),
+        typed_turn_completed_usage(payload),
+        result_event_usage(payload),
+        step_update_usage(payload),
+        claude_usage_from_update(update, payload)
+      ]
+      |> Enum.find(&is_map/1)
+
+    per_message = claude_message_usage(payload)
+
+    cond do
+      is_map(absolute) -> {:absolute, absolute}
+      is_map(per_message) -> {:additive, per_message}
+      true -> {:absolute, %{}}
+    end
   end
+
+  # Claude Code's `stream-json` reports usage per assistant message, nested
+  # under `message` rather than on the envelope:
+  #
+  #     {"type":"assistant","message":{…,"usage":{"input_tokens":2, …}}}
+  #
+  # Nothing else looks one level deeper, so before this existed a whole run's
+  # worth of these fell through to `%{}` and the token counters never moved off
+  # zero — the transcript that surfaced the bug reported 0 for a session that
+  # had actually spent ~2M tokens. The final
+  # `result` event does carry cumulative usage, but it only arrives if the CLI
+  # is allowed to exit on its own; an agent that ends a run by moving its
+  # ticket out of the active states is killed first, which is the normal happy
+  # path. Per-message accrual is what makes the counter live rather than
+  # a lump sum that may never land.
+  defp claude_message_usage(payload) when is_map(payload) do
+    type = Map.get(payload, "type") || Map.get(payload, :type)
+    message = Map.get(payload, "message") || Map.get(payload, :message)
+
+    if type in ["assistant", :assistant] and is_map(message) do
+      integer_token_map_or_nil(Map.get(message, "usage") || Map.get(message, :usage))
+    end
+  end
+
+  defp claude_message_usage(_payload), do: nil
 
   defp integer_token_map_or_nil(value) when is_map(value) do
     if integer_token_map?(value), do: value
@@ -315,8 +375,30 @@ defmodule CymphonyElixir.Orchestrator.Tokens do
     end)
   end
 
-  defp get_token_usage(usage, :input),
-    do:
+  # Claude leaves `input_tokens` holding only the *uncached* remainder — in a
+  # real run, literally `2` against a cached prefix of `56904` — so the bare
+  # field undercounts a cached session by over 99% and has to be topped up from
+  # the cache buckets.
+  #
+  # Only the **write** bucket counts. `cache_read_input_tokens` is deliberately
+  # excluded: it re-reports the whole cached prefix on every single turn, so
+  # summing it across a session counts one conversation's context once per
+  # turn. A two-hour, 41-turn pair of runs measured 1,952,593 cache-read
+  # tokens against 122,192 of everything else — a headline dominated 94% by
+  # re-reads, which reads like months of usage and tracks cost badly (reads
+  # bill at a tenth the input rate). What is left is the work the run actually
+  # caused: fresh input, cache writes, and output.
+  #
+  # This key name is Claude's alone. Antigravity's `cache_read_tokens` is not
+  # in the list either, for a different reason: its `result` usage already
+  # reports an inclusive `input_tokens`, so adding it would double-count.
+  @claude_cache_input_fields [
+    "cache_creation_input_tokens",
+    :cache_creation_input_tokens
+  ]
+
+  defp get_token_usage(usage, :input) do
+    base =
       payload_get(usage, [
         "input_tokens",
         "prompt_tokens",
@@ -328,6 +410,12 @@ defmodule CymphonyElixir.Orchestrator.Tokens do
         "inputTokens",
         :inputTokens
       ])
+
+    case cache_input_tokens(usage) do
+      nil -> base
+      cached -> (base || 0) + cached
+    end
+  end
 
   defp get_token_usage(usage, :output),
     do:
@@ -363,6 +451,19 @@ defmodule CymphonyElixir.Orchestrator.Tokens do
         if is_integer(input) or is_integer(output) do
           (input || 0) + (output || 0)
         end
+    end
+  end
+
+  # nil (rather than 0) when no cache field is present, so a usage map without
+  # them keeps returning nil for input and stays distinguishable from a genuine
+  # zero — `compute_token_delta/5` treats a non-integer as "not reported".
+  defp cache_input_tokens(usage) do
+    @claude_cache_input_fields
+    |> Enum.map(&map_integer_value(usage, &1))
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      values -> Enum.sum(values)
     end
   end
 

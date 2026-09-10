@@ -262,6 +262,7 @@ defmodule CymphonyElixir.Cymphony.ConfigLinearTest do
 
       assert project["linear_api_key"] == @lin_api_fake
       assert project["github_repo_url"] == "git@github.com:me/repo.git"
+      refute Map.has_key?(project, "repo_url")
       assert project["workspace_root"] == "/tmp/added"
       assert project["polling_interval_ms"] == 12_000
       assert project["agent"] == "codex"
@@ -273,6 +274,25 @@ defmodule CymphonyElixir.Cymphony.ConfigLinearTest do
       {:ok, saved} = CymphonyConfig.load()
       assert length(saved["projects"]) == 2
       assert List.last(saved["projects"]) == project
+    end
+
+    test "add_project persists repo_url and forge when given", %{path: path} do
+      write_config!(path, %{
+        "projects" => [%{"name" => "Existing", "linear_api_key" => @lin_api_fake}]
+      })
+
+      assert {:ok, project} =
+               CymphonyConfig.add_project(%{
+                 "name" => "GitLab Project",
+                 "linear_project_slug" => "glp",
+                 "repo_url" => "  https://gitlab.example.com/group/sub/repo.git  ",
+                 "forge" => "gitlab"
+               })
+
+      assert project["repo_url"] == "https://gitlab.example.com/group/sub/repo.git"
+      assert project["forge"] == "gitlab"
+      # The legacy key is only written when the caller used it.
+      refute Map.has_key?(project, "github_repo_url")
     end
 
     test "creates config.json from an env key when the file is missing", %{path: path} do

@@ -393,7 +393,13 @@ defmodule CymphonyElixir.CLI do
 
   defp print_project(project) do
     name = Map.get(project, "name", "unnamed")
-    slug = Map.get(project, "linear_project_slug", "n/a")
+
+    slug =
+      case CymphonyConfig.project_slug(project) do
+        "" -> "n/a"
+        slug -> slug
+      end
+
     IO.puts("  #{name} (slug: #{slug})")
   end
 
@@ -541,7 +547,15 @@ defmodule CymphonyElixir.CLI do
   end
 
   defp start_generated_projects(project_workflow_pairs, opts, deps) do
-    with :ok <- maybe_set_logs_root(opts, deps),
+    # Point the global config at the first project's workflow *before* the
+    # port override, which is what starts the endpoint: `HttpServer` reads its
+    # bind host from the loaded settings, so with no workflow visible yet a
+    # configured `server.host` (`0.0.0.0` in a container) was silently
+    # ignored and the dashboard bound 127.0.0.1.
+    {_first_project, first_workflow_path} = hd(project_workflow_pairs)
+
+    with :ok <- deps.set_workflow_file_path.(first_workflow_path),
+         :ok <- maybe_set_logs_root(opts, deps),
          :ok <- maybe_set_server_port(opts, deps) do
       run_multi_project(project_workflow_pairs, deps)
     end
@@ -592,6 +606,8 @@ defmodule CymphonyElixir.CLI do
 
     case deps.ensure_all_started.() do
       {:ok, _started_apps} ->
+        ensure_http_server_started()
+
         # Start each project under the DynamicSupervisor
         Enum.each(project_workflow_pairs, fn {project, workflow_path} ->
           project_name = Map.get(project, "name", "default")
@@ -705,6 +721,20 @@ defmodule CymphonyElixir.CLI do
   defp set_logs_root(logs_root) do
     Application.put_env(:cymphony_elixir, :log_file, LogFile.default_log_file(logs_root))
     :ok
+  end
+
+  # `--port` is not the only way to configure the dashboard: the workflow's
+  # `server.port` is read by `Config.server_port/0` too. In the release the
+  # supervision tree boots before any workflow is visible, so `HttpServer`
+  # came up as `:ignore` and a config-only port was silently dropped — and the
+  # release script does not forward argv, so `--port` is not available there
+  # at all. Retry the start now that the settings are loaded; with no port
+  # configured this is another no-op `:ignore`.
+  defp ensure_http_server_started do
+    case CymphonyElixir.HttpServer.ensure_started() do
+      :ok -> :ok
+      {:error, reason} -> IO.puts(:stderr, "Failed to start dashboard HTTP server: #{inspect(reason)}")
+    end
   end
 
   defp maybe_set_server_port(opts, deps) do

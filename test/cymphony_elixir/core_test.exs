@@ -1,6 +1,7 @@
 defmodule CymphonyElixir.CoreTest do
   use CymphonyElixir.TestSupport
 
+  alias CymphonyElixir.Config.Schema
   alias CymphonyElixir.Cymphony.PromptTemplate
 
   test "config defaults and validation checks" do
@@ -68,6 +69,37 @@ defmodule CymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+  end
+
+  test "a youtrack tracker needs a token, an instance URL and a project" do
+    {:ok, missing_token} = Schema.parse(%{"tracker" => %{"kind" => "youtrack"}})
+    assert Config.validate!(missing_token) == {:error, :missing_youtrack_token}
+
+    # `Schema` defaults the endpoint to Linear's GraphQL URL, so leaving it out
+    # must read as "no YouTrack URL" rather than silently posting a YouTrack
+    # token to api.linear.app.
+    {:ok, default_endpoint} = Schema.parse(%{"tracker" => %{"kind" => "youtrack", "api_key" => "perm:t"}})
+    assert default_endpoint.tracker.endpoint == "https://api.linear.app/graphql"
+    assert Config.validate!(default_endpoint) == {:error, :missing_youtrack_url}
+
+    {:ok, missing_project} =
+      Schema.parse(%{
+        "tracker" => %{"kind" => "youtrack", "api_key" => "perm:t", "endpoint" => "https://yt.example.com"}
+      })
+
+    assert Config.validate!(missing_project) == {:error, :missing_youtrack_project}
+
+    {:ok, complete} =
+      Schema.parse(%{
+        "tracker" => %{
+          "kind" => "youtrack",
+          "api_key" => "perm:t",
+          "endpoint" => "https://yt.example.com",
+          "project_slug" => "LLM"
+        }
+      })
+
+    assert Config.validate!(complete) == :ok
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -1218,10 +1250,18 @@ defmodule CymphonyElixir.CoreTest do
     prompt = PromptTemplate.get()
 
     assert prompt =~ "Review re-entry and human comment intake"
-    assert prompt =~ "Human Review"
-    assert prompt =~ "In Progress"
+    # The status map renders from config, so the raw template carries the
+    # variables rather than Linear's state names; `PromptWorkflowTest` covers
+    # what each workflow renders to.
+    assert prompt =~ "{{ workflow.review_state }}"
+    assert prompt =~ "{{ workflow.in_progress_state }}"
+    refute prompt =~ "`Human Review`"
+    refute prompt =~ "`Todo`"
     assert prompt =~ "Last processed human comment: <comment id or timestamp>"
-    assert prompt =~ "please fix merge conflicts on PR"
+    # The forge vocabulary is a variable so one template serves both GitHub and
+    # GitLab; `PromptBuilderForgeTest` covers what it renders to.
+    assert prompt =~ "please fix merge conflicts on {{ forge.review_abbr }}"
+    refute prompt =~ "gh pr merge"
   end
 
   test "prompt builder adds continuation guidance for retries" do

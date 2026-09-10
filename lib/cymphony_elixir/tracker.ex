@@ -66,6 +66,7 @@ defmodule CymphonyElixir.Tracker do
   def adapter do
     case Config.settings!().tracker.kind do
       "memory" -> CymphonyElixir.Tracker.Memory
+      "youtrack" -> CymphonyElixir.YouTrack.Adapter
       _ -> CymphonyElixir.Linear.Adapter
     end
   end
@@ -74,6 +75,7 @@ defmodule CymphonyElixir.Tracker do
   def adapter(config) do
     case config.tracker.kind do
       "memory" -> CymphonyElixir.Tracker.Memory
+      "youtrack" -> CymphonyElixir.YouTrack.Adapter
       _ -> CymphonyElixir.Linear.Adapter
     end
   end

@@ -14,8 +14,12 @@ defmodule CymphonyElixir.Agent.Claude do
   @impl true
   def auth_env_prefixes, do: ["ANTHROPIC_", "API_TIMEOUT", "CLAUDE_CODE_"]
 
+  # Inherited from the daemon's own environment when no provider supplies auth.
+  # `CLAUDE_CODE_OAUTH_TOKEN` is how a Claude Code *account* (rather than an API
+  # key) authenticates without a mounted `~/.claude` — the shape a container or
+  # CI runner needs.
   @impl true
-  def auth_env_fallback, do: ["ANTHROPIC_API_KEY"]
+  def auth_env_fallback, do: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
 
   @impl true
   def build_command(%{settings: settings} = run_spec) do

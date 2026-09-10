@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "Reference for ~/.cymphony/config.json. Copy it there, delete the keys you",
+    "do not need, and chmod 0600 — it holds tracker and forge tokens in",
+    "cleartext. Every key is optional except a project's name, tracker",
+    "credentials and repo_url; anything omitted falls back to the default",
+    "shown in README.md's 'config.json reference'. JSON has no comments, so",
+    "this key exists purely to carry that note and is ignored by Cymphony.",
+    "Two projects are shown: Linear + GitHub, and YouTrack + GitLab."
+  ],
+
+  "linear_api_key": "lin_api_xxxxxxxxxxxxxxxxxxxxxxxx",
+  "dashboard_refresh_seconds": 3,
+
+  "projects": [
+    {
+      "name": "MyApp",
+
+      "linear_project_slug": "myteam-ab12cd34ef56",
+      "linear_api_key": "lin_api_xxxxxxxxxxxxxxxxxxxxxxxx",
+
+      "forge": "github",
+      "repo_url": "git@github.com:you/myapp.git",
+      "forge_token": "$GH_TOKEN",
+
+      "workspace_root": "~/.cymphony/workspaces/myapp",
+      "max_concurrent_agents": 3,
+      "polling_interval_ms": 5000,
+
+      "agent": "claude",
+      "provider": "cz",
+      "providers": ["cz", "ck"]
+    },
+
+    {
+      "name": "MySQL",
+
+      "tracker_kind": "youtrack",
+      "tracker_endpoint": "https://example.youtrack.cloud",
+      "tracker_api_key": "perm-xxxxxxxxxxxxxxxxxxxxxxxx",
+      "tracker_project_slug": "MYSQL",
+      "tracker_assignee": "jeremy",
+
+      "state_field": "State",
+      "queued_states": ["Open", "Confirmed", "Reopened"],
+      "in_progress_state": "In Progress",
+      "review_state": "Review and Testing",
+      "merge_state": "",
+      "active_states": ["Open", "Confirmed", "Reopened", "In Progress"],
+      "terminal_states": [
+        "Fixed",
+        "Verified",
+        "Done",
+        "Closed",
+        "Duplicate",
+        "Can't reproduce",
+        "Won't Fix",
+        "Obsolete",
+        "Incomplete"
+      ],
+
+      "forge": "gitlab",
+      "forge_token": "$GITLAB_TOKEN",
+      "forge_host": "gitlab.example.com",
+      "repo_url": "ssh://git@gitlab.example.com:22448/group/mysql.git",
+      "rewrite_ssh_remote": false,
+      "branch_name_template": "{{ issue.identifier }}",
+
+      "agent": "claude",
+      "model": "claude-opus-5",
+      "effort": "high",
+      "claude_bare_mode": false,
+      "allowed_tools": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "mcp__youtrack"],
+      "permission_mode": "acceptEdits",
+      "extra_args": {
+        "codex": ["--full-auto"],
+        "antigravity": ["--new-project"]
+      },
+
+      "workspace_root": "~/.cymphony/workspaces/mysql",
+      "max_concurrent_agents": 2,
+      "stall_timeout_ms": 300000,
+      "dispatch_paused": false,
+
+      "server_host": "127.0.0.1",
+      "server_port": 4000,
+      "status_dashboard_enabled": true
+    }
+  ]
+}

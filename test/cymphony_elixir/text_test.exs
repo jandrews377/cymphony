@@ -104,7 +104,13 @@ defmodule CymphonyElixir.TextTest do
         {"jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3In0.abcdef bad", "eyJhbGci"},
         {"aws AKIAIOSFODNN7EXAMPLE denied", "AKIAIOSFODNN7EXAMPLE"},
         {"npm npm_abcdefghijklmnopqrstuvwxyz denied", "npm_abc"},
-        {"hugging hf_abcdefghijklmnopqrstuvwxyz denied", "hf_abc"}
+        {"hugging hf_abcdefghijklmnopqrstuvwxyz denied", "hf_abc"},
+        {"remote uses glpat-abcdefghij0123456789 rejected", "glpat-abc"},
+        {"deploy gldt-abcdefghij0123456789 rejected", "gldt-abc"},
+        {"runner glrt-abcdefghij0123456789 rejected", "glrt-abc"},
+        {"feed glft-abcdefghij0123456789 rejected", "glft-abc"},
+        {"oauth gloas-abcdefghij0123456789 rejected", "gloas-abc"},
+        {"clone https://oauth2:glpat-abcdefghij0123456789@gitlab.example.com/g/r.git", "glpat-abc"}
       ]
 
       Enum.each(cases, fn {line, secret_marker} ->

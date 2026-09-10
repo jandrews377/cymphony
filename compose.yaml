@@ -1,0 +1,53 @@
+# Cymphony under rootless Podman, running as you.
+#
+#   podman compose run --rm -e CYMPHONY_ARGS=setup cymphony   # first-time config
+#   podman compose up
+#   xdg-open http://localhost:4000
+#
+# The container is a dependency sandbox, not a security boundary: it pins the
+# toolchain (Elixir/OTP, Node, Claude Code, glab/gh, git) and then runs as your
+# uid against your real home, so ~/.cymphony, ~/.claude and ~/.cld are the same
+# files a native install would use. See docs/podman.md.
+
+services:
+  cymphony:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: localhost/cymphony:local
+
+    # Map the invoking uid straight through, so every file the agent writes —
+    # clones, config, logs, refreshed Claude credentials — is owned by you and
+    # not by a subuid.
+    userns_mode: keep-id
+
+    # SELinux: do NOT put :z/:Z on the $HOME mount, which would recursively
+    # relabel your entire home directory. Disabling the label for this
+    # container is the correct trade for a sandbox that is meant to see your
+    # home in the first place.
+    security_opt:
+      - label=disable
+
+    # Host networking keeps the dashboard exactly where a native run puts it,
+    # so `server.host` stays 127.0.0.1 in your config.json and nothing about
+    # the config differs between containerized and native.
+    network_mode: host
+
+    environment:
+      HOME: ${HOME}
+      # Your ssh-agent, for SSH remotes. Harmless when unset.
+      SSH_AUTH_SOCK: ${SSH_AUTH_SOCK:-}
+      # Optional; the entrypoint only warns when they are absent.
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+      GITLAB_HOST: ${GITLAB_HOST:-}
+      GH_TOKEN: ${GH_TOKEN:-}
+      # Reaches the CLI as argv (`setup`, `list`, `project Foo cr 3`, …),
+      # which the release script cannot forward on its own.
+      CYMPHONY_ARGS: ${CYMPHONY_ARGS:-}
+
+    volumes:
+      - ${HOME}:${HOME}
+
+    working_dir: ${HOME}
+    init: true
+    restart: unless-stopped

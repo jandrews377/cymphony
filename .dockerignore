@@ -1,0 +1,23 @@
+# Build context for docker/Dockerfile (podman honours this file too): only
+# mix.exs/mix.lock, config/, lib/, priv/ and WORKFLOW.md are COPYed, so
+# everything else is transfer cost.
+.git
+.github
+_build
+deps
+cover
+doc
+bin
+burrito_out
+tmp
+log
+logs
+test
+docs
+.elixir_ls
+.mise.toml
+mise.toml
+*.md
+!WORKFLOW.md
+.env
+.env.*

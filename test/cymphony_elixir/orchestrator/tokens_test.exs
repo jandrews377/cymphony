@@ -495,4 +495,193 @@ defmodule CymphonyElixir.Orchestrator.TokensTest do
       assert Tokens.extract_rate_limits(:not_a_map) == nil
     end
   end
+
+  # Regression suite for the counter that stayed at zero through a whole run.
+  # The shapes here are copied from a real ~/.cymphony/log transcript.
+  describe "extract_token_delta/2 — Claude stream-json per-message usage" do
+    test "reads usage nested under message, which the envelope does not carry" do
+      update =
+        assistant_event(%{
+          "input_tokens" => 2,
+          "cache_creation_input_tokens" => 2320,
+          "cache_read_input_tokens" => 56_904,
+          "output_tokens" => 16
+        })
+
+      delta = Tokens.extract_token_delta(%{}, update)
+
+      # 2 + 2320: fresh input plus the cache *write*. The bare input_tokens
+      # field alone is 2, and the 56904-token cache read is excluded.
+      assert delta.input_tokens == 2322
+      assert delta.output_tokens == 16
+      assert delta.total_tokens == 2338
+    end
+
+    test "cache reads are excluded so a long session is not counted once per turn" do
+      # The prefix is re-reported in full on every turn; summing it made a
+      # two-hour run read like months of usage.
+      turn = fn read ->
+        assistant_event(%{
+          "input_tokens" => 2,
+          "cache_creation_input_tokens" => 100,
+          "cache_read_input_tokens" => read,
+          "output_tokens" => 3
+        })
+      end
+
+      entry = %{}
+
+      {total, _entry} =
+        Enum.reduce([10_000, 35_000, 50_000, 56_904], {0, entry}, fn read, {sum, acc} ->
+          delta = Tokens.extract_token_delta(acc, turn.(read))
+
+          {sum + delta.input_tokens,
+           %{
+             last_reported_input_tokens: delta.input_reported,
+             last_reported_output_tokens: delta.output_reported,
+             last_reported_total_tokens: delta.total_reported
+           }}
+        end)
+
+      # 4 turns x (2 + 100). Not 151_904 + 408.
+      assert total == 408
+    end
+
+    test "sums successive messages instead of diffing them" do
+      # The bug: per-message input_tokens sits at 2 for every turn, so the
+      # monotonic absolute-diff rule scored each one as zero.
+      first = assistant_event(%{"input_tokens" => 2, "output_tokens" => 10})
+      second = assistant_event(%{"input_tokens" => 2, "output_tokens" => 7})
+
+      d1 = Tokens.extract_token_delta(%{}, first)
+      assert d1.input_tokens == 2
+      assert d1.output_tokens == 10
+
+      entry = %{
+        last_reported_input_tokens: d1.input_reported,
+        last_reported_output_tokens: d1.output_reported,
+        last_reported_total_tokens: d1.total_reported
+      }
+
+      d2 = Tokens.extract_token_delta(entry, second)
+      assert d2.input_tokens == 2
+      assert d2.output_tokens == 7
+    end
+
+    test "carries a running sum in `reported` so a later result event cannot double-count" do
+      turn = assistant_event(%{"input_tokens" => 100, "output_tokens" => 20})
+      d1 = Tokens.extract_token_delta(%{}, turn)
+
+      entry = %{
+        last_reported_input_tokens: d1.input_reported,
+        last_reported_output_tokens: d1.output_reported,
+        last_reported_total_tokens: d1.total_reported
+      }
+
+      # The CLI's final cumulative frame: 150 in / 25 out for the session.
+      result = %{
+        event: :stream_event,
+        timestamp: @ts,
+        payload: %{"type" => "result", "usage" => %{"input_tokens" => 150, "output_tokens" => 25}}
+      }
+
+      d2 = Tokens.extract_token_delta(entry, result)
+
+      # Only the correction lands, not the whole session a second time.
+      assert d2.input_tokens == 50
+      assert d2.output_tokens == 5
+      assert d1.input_tokens + d2.input_tokens == 150
+      assert d1.output_tokens + d2.output_tokens == 25
+    end
+
+    test "a message with no usage contributes nothing and preserves the running sum" do
+      entry = %{last_reported_input_tokens: 500, last_reported_output_tokens: 30}
+
+      update = %{
+        event: :stream_event,
+        timestamp: @ts,
+        payload: %{"type" => "assistant", "message" => %{"role" => "assistant"}}
+      }
+
+      delta = Tokens.extract_token_delta(entry, update)
+
+      assert delta.input_tokens == 0
+      assert delta.output_tokens == 0
+      assert delta.input_reported == 500
+      assert delta.output_reported == 30
+    end
+
+    test "an envelope-level usage still wins over message.usage" do
+      update = %{
+        event: :stream_event,
+        timestamp: @ts,
+        payload: %{
+          "type" => "assistant",
+          "usage" => %{"input_tokens" => 900, "output_tokens" => 90},
+          "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 1}}
+        }
+      }
+
+      delta = Tokens.extract_token_delta(%{}, update)
+      assert delta.input_tokens == 900
+      assert delta.output_tokens == 90
+    end
+
+    test "cache writes count toward input on an absolute result frame too" do
+      update = %{
+        event: :stream_event,
+        timestamp: @ts,
+        payload: %{
+          "type" => "result",
+          "usage" => %{
+            "input_tokens" => 5,
+            "cache_creation_input_tokens" => 100,
+            "cache_read_input_tokens" => 1000,
+            "output_tokens" => 7
+          }
+        }
+      }
+
+      assert Tokens.extract_token_delta(%{}, update).input_tokens == 105
+    end
+
+    test "Antigravity cache_read_tokens is not folded into input" do
+      # Its result usage already reports an inclusive input_tokens, so adding
+      # the cache field would double-count.
+      update = %{
+        event: :stream_event,
+        timestamp: @ts,
+        payload: %{
+          "event" => "result",
+          "result" => %{
+            "usage" => %{
+              "input_tokens" => 40,
+              "output_tokens" => 9,
+              "cache_read_tokens" => 2,
+              "total_tokens" => 49
+            }
+          }
+        }
+      }
+
+      assert Tokens.extract_token_delta(%{}, update).input_tokens == 40
+    end
+  end
+
+  # A Claude `stream-json` assistant event, shaped as the CLI emits it.
+  defp assistant_event(usage) do
+    %{
+      event: :stream_event,
+      timestamp: @ts,
+      payload: %{
+        "type" => "assistant",
+        "message" => %{
+          "model" => "claude-opus-5",
+          "type" => "message",
+          "role" => "assistant",
+          "usage" => usage
+        }
+      }
+    }
+  end
 end

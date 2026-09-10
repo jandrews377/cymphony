@@ -19,6 +19,7 @@ defmodule CymphonyElixir.MixProject do
           CymphonyElixir.Config,
           CymphonyElixir.CompletionStore,
           CymphonyElixir.Linear.Client,
+          CymphonyElixir.YouTrack.Client,
           CymphonyElixir.SpecsCheck,
           CymphonyElixir.Orchestrator,
           CymphonyElixir.Orchestrator.State,
@@ -118,6 +119,14 @@ defmodule CymphonyElixir.MixProject do
 
   defp releases do
     [
+      # Plain assembled release for containers: same `BurritoCLI` entrypoint
+      # (supervision tree first, then `CLI.main/1`), but no Zig wrapper step,
+      # so it builds without the Burrito toolchain. Unlike the escript it
+      # carries deps' `priv/` directories, which is what exqlite's NIF needs.
+      cymphony_docker: [
+        applications: [cymphony_elixir: :permanent],
+        steps: [:assemble]
+      ],
       cymphony: [
         steps: [:assemble, &Burrito.wrap/1],
         burrito: [

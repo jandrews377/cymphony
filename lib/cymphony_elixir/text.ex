@@ -98,6 +98,9 @@ defmodule CymphonyElixir.Text do
     "lin_api_[A-Za-z0-9_-]+",
     "gh[pousr]_[A-Za-z0-9]{20,}",
     "github_pat_[A-Za-z0-9_]{20,}",
+    # GitLab: personal/project/group access tokens (`glpat-`), plus the
+    # deploy, runner, feed, OAuth-application and CI job token prefixes.
+    "gl(?:pat|dt|rt|ft|oas|cbt|soat|ptt)-[A-Za-z0-9_-]{20,}",
     "xox[a-z]-[A-Za-z0-9-]+",
     "AIza[0-9A-Za-z_-]{35}",
     "ya29\\.[A-Za-z0-9_-]{20,}",
@@ -145,7 +148,9 @@ defmodule CymphonyElixir.Text do
   * `Authorization` and `Cookie` headers, to end of line, with or without a
     scheme — `Bearer`, `Basic`, or none — because the scheme is not the secret.
   * bare credentials with a known vendor prefix: `sk-`, `lin_api_`, `gh[pousr]_`,
-    `github_pat_`, `xox<a>-`, `AIza`, `ya29.`, `1//`, JWTs, `AKIA`, `npm_`, `hf_`.
+    `github_pat_`, GitLab's `glpat-`/`gldt-`/`glrt-`/`glft-`/`gloas-`/`glcbt-`/
+    `glsoat-`/`glptt-`, `xox<a>-`, `AIza`, `ya29.`, `1//`, JWTs, `AKIA`, `npm_`,
+    `hf_`.
 
   Two deliberate carve-outs keep diagnostics readable, because the messages
   this protects are the ones operators most need:

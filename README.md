@@ -2,7 +2,7 @@
 
 > A modern rewrite of [openai/symphony](https://github.com/openai/symphony), using **Claude Code** instead of Codex.
 
-Cymphony turns Linear tickets into autonomous coding sessions. Drop a ticket into "Todo" and Cymphony picks it up, spins up a sandboxed workspace, and lets Claude Code work on it until the issue closes. You manage **work**, not agents.
+Cymphony turns Linear or YouTrack tickets into autonomous coding sessions. Drop a ticket into "Todo" and Cymphony picks it up, spins up a sandboxed workspace, and lets Claude Code work on it until the issue closes. You manage **work**, not agents.
 
 **Live web dashboard** — per-project sections, kill/retry/pause/set-provider per session, real-time activity:
 
@@ -27,6 +27,9 @@ If you've used [openai/symphony](https://github.com/openai/symphony), the core i
 | Providers | one API endpoint | **Rotate across multiple Claude-compatible backends** — list two or more providers and Cymphony spreads new sessions across them randomly. Avoids hitting any single backend's rate limit. |
 | Live UI | terminal-only | **Phoenix LiveView dashboard** with kill / retry / pause / set-provider per running session |
 | HTTP API | — | `/api/v1/*` for state, pause, concurrency, providers, queue order/pin, refresh, Linear connect, add-project |
+| Issue tracker | Linear | **Linear or YouTrack** — `tracker_kind` per project, with the workflow state names (queued / in-progress / active / terminal) as config rather than constants |
+| Code review | GitHub | **GitHub or GitLab** — `forge` per project; the agent prompt renders `gh`/pull request or `glab`/merge request from one template |
+| Local dev | — | **`podman compose up`** — the toolchain (Elixir, Node, Claude Code, `glab`/`gh`) pinned in a container that runs as *you*, against your real `~/.cymphony` and `~/.claude` ([docs/podman.md](docs/podman.md)) |
 | Workspace lifecycle | clone-on-create | **after_create / before_run / after_run / before_remove hooks**, optional retention sweep |
 | Setup | edit a YAML file | `cymphony setup` wizard, all config in `~/.cymphony/config.json` |
 | Hot reload | restart | edit `WORKFLOW.md`, picked up next tick |
@@ -517,6 +520,302 @@ All under `/api/v1/`:
 | `GET` | `/completed` `?limit=N` | recent completions ring buffer |
 
 `/linear`, `/linear/projects`, `POST /projects`, `POST /api/v1/queue`, `POST /api/v1/queue-pin`, and `POST /refresh-interval` are declared before `/<issue_identifier>`. Unsupported methods on those routes return `405`. `POST /linear` never echoes `api_key`.
+
+---
+
+## YouTrack instead of Linear
+
+Set `tracker_kind` on a project in `~/.cymphony/config.json` (see
+[`config.json.example`](config.json.example) for a complete file):
+
+```json
+{
+  "projects": [
+    {
+      "name": "My Project",
+      "tracker_kind": "youtrack",
+      "tracker_endpoint": "https://example.youtrack.cloud",
+      "tracker_api_key": "perm:…",
+      "tracker_project_slug": "LLM",
+      "queued_states": ["Open", "Confirmed", "Reopened"],
+      "in_progress_state": "In Progress",
+      "review_state": "Review and Testing",
+      "merge_state": "",
+      "active_states": ["Open", "Confirmed", "Reopened", "In Progress"],
+      "terminal_states": ["Fixed", "Verified", "Done", "Closed"],
+      "forge": "gitlab",
+      "repo_url": "https://gitlab.example.com/your-group/your-repo.git"
+    }
+  ]
+}
+```
+
+`tracker_endpoint` is the instance root (not `/api`), `tracker_api_key` is a
+permanent token from Profile → Account Security → Authentication, and
+`tracker_project_slug` is the project's short name — the `LLM` in `LLM-51`.
+
+Because a tracker owns its own workflow vocabulary, the state machine is
+config, and the agent's prompt renders its status map from it — no tracker's
+state names are hardcoded. `active_states` means *keep re-dispatching until the
+issue leaves this set*, so `review_state` (where the agent hands off to a human)
+must stay out of it. An empty `merge_state` means humans merge, and the prompt
+drops the merge protocol entirely. The defaults are Linear's, so a YouTrack
+project should set them all.
+
+Per-issue overrides work the same way as on Linear, via YouTrack **tags**
+(`agent:codex`, `model:…`, `effort:…`) or a `cymphony: agent=codex` line in the
+description.
+
+---
+
+## GitLab instead of GitHub
+
+Set `forge` on the project (`github` is the default) and give it a `repo_url`:
+
+```json
+{ "forge": "gitlab", "repo_url": "https://gitlab.example.com/group/repo.git" }
+```
+
+`forge` is not only about credentials — it decides what the agent is told to
+do. The built-in prompt is one document for both platforms, rendering either
+`gh` + "pull request" or `glab` + "merge request", so a GitLab project never
+gets instructions to run a CLI it does not have. An `scp`-style remote
+(`git@gitlab.example.com:group/sub/repo.git`) is rewritten to HTTPS so the
+clone can use the `glab` credential helper instead of an SSH key.
+
+### Credentials
+
+`forge_token` and `forge_host` on the project are the durable home for these:
+
+```json
+{
+  "forge": "gitlab",
+  "forge_token": "$GITLAB_TOKEN",
+  "forge_host": "gitlab.example.com",
+  "repo_url": "git@gitlab.example.com:group/repo.git"
+}
+```
+
+A literal value works, and so does `"$GITLAB_TOKEN"`, which reads that
+environment variable when the config loads and keeps the secret out of the
+file. The agent receives them as `GITLAB_TOKEN`, `GLAB_TOKEN` and `GITLAB_HOST`
+(or `GH_TOKEN` / `GITHUB_TOKEN` when `forge` is `github`). `GITLAB_HOST` matters
+on a self-hosted instance — without it `glab` talks to gitlab.com.
+
+Omit both and the daemon's own environment is inherited instead, so an exported
+`GITLAB_TOKEN` still works. Config wins when both are set.
+
+### Which GitLab permissions the token needs
+
+**Scope: `api`. Role: Developer.**
+
+GitLab has no finer split — `read_api` is read-only-everything and `api` is
+full — and the agent both reads and writes:
+
+| What the prompt tells the agent to do | GitLab call | Access |
+|---|---|---|
+| Read MR comments, inline notes, review state (the feedback sweep) | `GET …/merge_requests/:iid/notes`, `discussions` | read |
+| Push back on a review comment | `POST …/notes` | write |
+| Ensure the MR carries the `cymphony` label | `PUT …/merge_requests/:iid` | write |
+| Confirm MR checks are green before handoff | `GET …/pipelines` | read |
+| Create the MR | `git push` push-options over SSH | none |
+| Merge | only when `merge_state` is set; humans merge otherwise | write |
+
+Developer is the floor: Reporter can comment on an MR but cannot set labels.
+Maintainer is needed only if you set a `merge_state` and let the agent merge.
+
+`read_repository` / `write_repository` are irrelevant when git traffic goes over
+SSH — which is what `rewrite_ssh_remote: false` gives you, the recommended
+setting under Podman. They matter only if you clone over HTTPS with this token.
+
+**Prefer a Project Access Token over your personal one.** Project → Settings →
+Access tokens → scope `api`, role Developer, with an expiry. A PAT is scoped to
+*you*, so `api` reaches every project you can see — a wide blast radius for a
+token that sits in a config file and is handed to an autonomous agent. A project
+token also posts as `project_N_bot`, which keeps agent and human visibly
+distinct in review threads. Project access tokens need Premium/Ultimate or a
+self-managed instance.
+
+Starting with `read_api` is a reasonable way to watch it first: the sweep's
+reads work, the writes fail, and the agent logs that it could not set the label
+or reply and carries on — the prompt treats the forge as a non-blocker.
+
+Because SSH push-options create the MR without any API call at all, a project
+with no token still opens merge requests. What breaks silently is everything
+*after* that: it cannot read review comments, so the feedback loop never sees
+them.
+
+---
+
+## Rootless Podman
+
+Pin the toolchain without giving up the native behaviour. The container is a
+**dependency sandbox, not a security boundary**: `--userns=keep-id` runs it as
+your uid and your home is mounted at the same path, so `~/.cymphony/config.json`,
+`~/.claude`, `~/.cld`, `~/.ssh` and `~/.gitconfig` are the same files a native
+install uses, and every file the agent writes is owned by you on the host.
+
+That is the whole point. You get a pinned Elixir 1.19 / OTP 28, Node, Claude
+Code, `glab`/`gh`, plus the .NET SDK and Playwright's Chromium **inside the
+image** — nothing is borrowed from your host and nothing has to be installed on
+it — while the orchestrator still behaves exactly like a native run.
+
+### Prerequisites
+
+```bash
+podman --version                                    # 4.x or newer
+systemctl --user enable --now podman.socket         # once; `podman compose` needs it
+```
+
+`podman compose` delegates to the Docker Compose plugin and talks to that
+socket. Without it every command fails with
+`failed to connect to the docker API at …/podman.sock`.
+
+### First run
+
+```bash
+git clone https://github.com/zaalipro/cymphony && cd cymphony
+podman compose build                                # ~10 min the first time
+
+cp config.json.example ~/.cymphony/config.json      # then edit it
+chmod 600 ~/.cymphony/config.json
+
+podman compose up -d
+xdg-open http://localhost:4000
+```
+
+**Write `~/.cymphony/config.json` yourself** — start from
+[`config.json.example`](config.json.example). The container never generates it;
+the entrypoint only preflights and refuses to start with instructions when it is
+missing. Do *not* reach for the `setup` wizard for a YouTrack or GitLab project:
+it asks Linear/GitHub questions only and writes `linear_*` keys, so it produces
+the wrong shape. For a Linear + GitHub project it is fine:
+
+```bash
+podman compose run --rm -e CYMPHONY_ARGS=setup cymphony
+```
+
+`CYMPHONY_ARGS` is the argv channel — `setup`, `list`, `project Foo cr 3`. An
+OTP release's `start` does not forward arguments, so this env var is the only
+way to reach a CLI command in the container.
+
+### Things that surprise people
+
+- **There is no env-var config layer.** Configuration is
+  `~/.cymphony/config.json`, exactly as native. Tokens go in the file (or in it
+  as `"$GITLAB_TOKEN"` indirection), not into `compose.yaml`.
+- **Never put `:z` or `:Z` on the `$HOME` mount** — that recursively relabels
+  your entire home directory. `security_opt: label=disable` is the correct trade
+  for a container meant to see your home in the first place.
+- **`network_mode: host`**, so `server.host` stays `127.0.0.1` and a config that
+  works natively works containerized unchanged.
+- **Set `rewrite_ssh_remote: false`** for an SSH remote. Cymphony otherwise
+  rewrites `git@host:group/repo.git` to HTTPS, which is right when the worker has
+  no key — but running as you, your `~/.ssh` and agent socket are already there.
+- **Set `claude_bare_mode: false`** to authenticate as a Claude Code *account*.
+  The default `claude --bare` skips credential reads and fails with
+  `Not logged in · Please run /login` even with valid credentials.
+- **Provider rotation works here.** `zsh` is in the image and `~/.cld` is part of
+  the mounted home, so `c cz1,cv2` behaves as it does natively.
+
+### Everyday commands
+
+```bash
+podman compose logs -f cymphony     # boot output and crashes
+tail -f ~/.cymphony/daemon.log      # warnings+, on the host
+ls ~/.cymphony/workspaces           # live workspaces, on the host
+podman compose up -d --force-recreate   # after a config change
+podman compose build && podman compose up -d --force-recreate   # after an image change
+```
+
+Because it is your home, host tools work directly — no `podman compose exec`
+needed to inspect state.
+
+See **[docs/podman.md](docs/podman.md)** for the full mount rationale, a
+complete annotated YouTrack + GitLab config, the plain `podman run` equivalent,
+and troubleshooting.
+
+---
+
+## `config.json` reference
+
+Everything lives in `~/.cymphony/config.json` (mode `0600` — it holds tracker
+and forge tokens in cleartext). [`config.json.example`](config.json.example) is
+a copy-paste starting point showing both a Linear + GitHub and a YouTrack +
+GitLab project.
+
+### Top level
+
+| Key | Default | Meaning |
+|---|---|---|
+| `projects` | — | Array of project entries (below). The only required key. |
+| `linear_api_key` | — | Fleet-wide Linear key; a project's own `linear_api_key` / `tracker_api_key` wins. |
+| `dashboard_refresh_seconds` | `3` | How often the dashboard reloads its payload. **Not** the tracker poll interval. |
+
+### Per project — identity and tracker
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | slug | Display name, and how the CLI's `project <name>` finds it. |
+| `tracker_kind` | `linear` | `linear`, `youtrack`, or `memory` (tests). Unknown values fall back to Linear **and warn**. |
+| `tracker_endpoint` | Linear's API | YouTrack instance **root**, not the API root. Required for YouTrack. |
+| `tracker_api_key` | `linear_api_key` | Linear key, or a YouTrack permanent token. |
+| `tracker_project_slug` | `linear_project_slug` | Linear slug, or a YouTrack short name (the `MYSQL` in `MYSQL-51`). |
+| `tracker_assignee` | — | Only route this user's issues to this worker. Omit for all. |
+
+### Per project — workflow states
+
+The words for each stage belong to the tracker, so they are config, and the
+agent's prompt renders its status map from them. Defaults are Linear's.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `state_field` | `State` | YouTrack custom field holding the state. Projects rename it (`Stage`); the wrong name yields `state: nil` and **nothing ever dispatches**. |
+| `queued_states` | `["Todo"]` | Not started. Blocker-gated; dispatch transitions out of these. |
+| `in_progress_state` | `In Progress` | Where a dispatched issue is moved. Blank skips the transition. |
+| `review_state` | `Human Review` | Where the agent hands off to a human. |
+| `merge_state` | `Merging` | "Approved, go merge." **Blank means humans merge** and the prompt drops the land/merge protocol entirely. |
+| `active_states` | `["Todo","In Progress","Merging","Rework"]` | *Keep re-dispatching until the issue leaves this set.* `review_state` must stay **out** of it, or agents thrash on tickets a reviewer already owns. |
+| `terminal_states` | `["Closed","Cancelled","Canceled","Duplicate","Done"]` | Finished; releases blocked dependents. |
+
+### Per project — forge
+
+| Key | Default | Meaning |
+|---|---|---|
+| `forge` | `github` | `github` or `gitlab`. Decides the CLI, the vocabulary and the review commands in the prompt. |
+| `repo_url` | — | Clone URL. (`github_repo_url` is the legacy spelling and still read.) |
+| `forge_token` | — | Injected as `GITLAB_TOKEN`/`GLAB_TOKEN` or `GH_TOKEN`/`GITHUB_TOKEN`. `$VAR_NAME` indirection supported. See [permissions](#which-gitlab-permissions-the-token-needs). |
+| `forge_host` | — | `GITLAB_HOST` for a self-hosted instance; without it `glab` talks to gitlab.com. |
+| `rewrite_ssh_remote` | `true` | Rewrites an `scp`-style remote to HTTPS. Set `false` to keep SSH (right under Podman). |
+| `branch_name_template` | `{{ issue.identifier }}` | Liquid template for the working branch. Sanitized to a legal git ref; a broken template falls back to the identifier. |
+
+### Per project — agent
+
+| Key | Default | Meaning |
+|---|---|---|
+| `agent` | `claude` | `claude`, `codex`, or `antigravity`. |
+| `model` / `effort` | — | Passed through to the agent CLI. |
+| `provider` / `providers` | — | Auth alias, or a list to rotate across. Applies to the active agent kind only. |
+| `claude_bare_mode` | `true` | **Only an explicit `false`** disables `claude --bare`, which is required for Claude Code *account* auth. |
+| `allowed_tools` | `Bash,Read,Edit,Write,Glob,Grep` + the tracker's MCP server | Claude `--allowedTools`. A list or a comma-separated string. Under headless `-p` an ungranted tool is not a prompt but a `permission_denied`, so anything the prompt asks the agent to do must be listed. |
+| `permission_mode` | `acceptEdits` | Claude `--permission-mode`. |
+| `extra_args` | — | Pass-through CLI flags: `["--add-dir","/srv"]` or `{"codex":["--full-auto"]}`. Only the active kind's list is used. Trusted operator input. |
+| `new_project` | `true` | Antigravity only. **Only an explicit `false`** drops `--new-project`. |
+
+### Per project — runtime
+
+| Key | Default | Meaning |
+|---|---|---|
+| `workspace_root` | `~/.cymphony/workspaces` | Where per-issue clones live. |
+| `polling_interval_ms` | `5000` | Tracker poll cadence. |
+| `max_concurrent_agents` | `10` | Sessions in flight for this project (the `cr N` flag). |
+| `stall_timeout_ms` | `300000` | Agent-event silence before the watchdog kills a session. Only a positive integer is honoured; a typo falls back rather than disabling it. |
+| `dispatch_paused` | `false` | Durable pause. Written by the dashboard and API too. |
+| `server_host` / `server_port` | `127.0.0.1` / — | Dashboard bind address. |
+| `status_dashboard_enabled` | `true` | Only an explicit `false` disables the terminal TUI (right for a container or systemd unit reading stdout as a log). |
+
+`queue_order`, `queue_pins` and `queue_priority_seen` also appear in the file —
+those are managed by Cymphony (queue drag-and-drop and pins), not hand-edited.
 
 ---
 

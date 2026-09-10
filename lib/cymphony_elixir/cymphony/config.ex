@@ -4,9 +4,13 @@ defmodule CymphonyElixir.Cymphony.Config do
   require Logger
 
   alias CymphonyElixir.Agent
+  alias CymphonyElixir.Config.Schema
   alias CymphonyElixir.Cymphony.Defaults
 
   @config_dir "~/.cymphony"
+  # Tracker backends a generated `WORKFLOW.md` may name. "memory" is the test
+  # adapter and deliberately not offered here.
+  @tracker_kinds ["linear", "youtrack"]
   @config_file "config.json"
   @default_dashboard_refresh_seconds 3
   # Owner read/write only: config.json carries the Linear API key in cleartext.
@@ -261,8 +265,9 @@ defmodule CymphonyElixir.Cymphony.Config do
       "workspace_root" => added_workspace_root(attrs, name),
       "polling_interval_ms" => added_polling_interval_ms(attrs)
     }
-    |> maybe_put_copied(attrs, "github_repo_url")
+    |> maybe_put_repo_url(attrs)
     |> maybe_put_agent(attrs)
+    |> maybe_put_copied(attrs, "forge")
     |> maybe_put_copied(attrs, "model")
     |> maybe_put_copied(attrs, "effort")
     |> maybe_put_copied(attrs, "provider")
@@ -279,6 +284,16 @@ defmodule CymphonyElixir.Cymphony.Config do
     case Map.get(attrs, "polling_interval_ms") do
       n when is_integer(n) and n > 0 -> n
       _ -> Defaults.polling_interval_ms()
+    end
+  end
+
+  # Persist under the current key when the caller used it, and leave a
+  # `github_repo_url`-only caller (the dashboard form, older API clients)
+  # writing the legacy key it already writes. `repo_url/1` reads both.
+  defp maybe_put_repo_url(map, attrs) do
+    case present_string(Map.get(attrs, "repo_url")) do
+      nil -> maybe_put_copied(map, attrs, "github_repo_url")
+      value -> Map.put(map, "repo_url", value)
     end
   end
 
@@ -845,13 +860,7 @@ defmodule CymphonyElixir.Cymphony.Config do
   @spec to_schema_map(map()) :: map()
   def to_schema_map(config) when is_map(config) do
     base = %{
-      "tracker" => %{
-        "kind" => "linear",
-        "api_key" => Map.get(config, "linear_api_key", ""),
-        "project_slug" => Map.get(config, "linear_project_slug", ""),
-        "active_states" => Defaults.active_states(),
-        "terminal_states" => Defaults.terminal_states()
-      },
+      "tracker" => tracker_map(config),
       "polling" => %{
         "interval_ms" => Map.get(config, "polling_interval_ms", Defaults.polling_interval_ms())
       },
@@ -871,8 +880,175 @@ defmodule CymphonyElixir.Cymphony.Config do
       "antigravity" => agent_section_map(config, "antigravity")
     }
 
-    maybe_put_hooks(base, config)
+    base
+    |> Map.put("forge", forge(config))
+    |> Map.put("branch_name_template", tracker_state(config, "branch_name_template", Defaults.branch_name_template()))
+    |> maybe_put_string(config, "forge_token", "forge_token")
+    |> maybe_put_string(config, "forge_host", "forge_host")
+    |> maybe_put_server(config)
+    |> maybe_put_observability(config)
+    |> maybe_put_hooks(config)
   end
+
+  # The status TUI repaints the whole terminal on its tick, which is right for
+  # a daemon an operator is watching and wrong for anything reading stdout as
+  # a log stream (a container, a systemd unit). Only an explicit `false`
+  # disables it, so a typo cannot silently take the TUI away.
+  defp maybe_put_observability(base, config) do
+    case Map.get(config, "status_dashboard_enabled") do
+      false -> Map.put(base, "observability", %{"dashboard_enabled" => false})
+      _ -> base
+    end
+  end
+
+  # The tracker section stays Linear-shaped by default so every existing
+  # `config.json` generates byte-identical front matter. A project only leaves
+  # that shape when it explicitly names another `tracker_kind`.
+  defp tracker_map(config) do
+    %{
+      "kind" => tracker_kind(config),
+      "api_key" => tracker_string(config, "tracker_api_key", "linear_api_key"),
+      "project_slug" => tracker_string(config, "tracker_project_slug", "linear_project_slug"),
+      "state_field" => tracker_state(config, "state_field", Defaults.state_field()),
+      "queued_states" => state_list(config, "queued_states", Defaults.queued_states()),
+      "in_progress_state" => tracker_state(config, "in_progress_state", Defaults.in_progress_state()),
+      "review_state" => tracker_state(config, "review_state", Defaults.review_state()),
+      "merge_state" => tracker_state(config, "merge_state", Defaults.merge_state()),
+      "active_states" => state_list(config, "active_states", Defaults.active_states()),
+      "terminal_states" => state_list(config, "terminal_states", Defaults.terminal_states())
+    }
+    |> maybe_put_string(config, "endpoint", "tracker_endpoint")
+    |> maybe_put_string(config, "assignee", "tracker_assignee")
+  end
+
+  # Which code-hosting platform the repo lives on. Drives the prompt's CLI and
+  # vocabulary (`gh`/pull request vs `glab`/merge request). An unknown value
+  # warns and falls back rather than generating front matter that would fail
+  # `Schema.parse/1`; the schema is lenient about it too, but a typo caught
+  # here names the file the operator actually edits.
+  defp forge(config) do
+    case Map.get(config, "forge") do
+      nil ->
+        Defaults.forge()
+
+      value when is_binary(value) ->
+        normalized = value |> String.trim() |> String.downcase()
+
+        if normalized in Schema.Forge.kinds() do
+          normalized
+        else
+          warn_unknown_forge(value)
+        end
+
+      other ->
+        warn_unknown_forge(other)
+    end
+  end
+
+  defp warn_unknown_forge(value) do
+    Logger.warning("Ignoring unknown forge in config.json: #{inspect(value)} (using #{Defaults.forge()})")
+
+    Defaults.forge()
+  end
+
+  # An unknown kind falls back to Linear *and says so*: unlike a numeric typo
+  # this one is otherwise invisible, and a silently-Linear project polls the
+  # wrong tracker forever.
+  defp tracker_kind(config) do
+    case Map.get(config, "tracker_kind") do
+      nil ->
+        "linear"
+
+      kind when kind in @tracker_kinds ->
+        kind
+
+      other ->
+        Logger.warning("Ignoring unknown tracker_kind in config.json: #{inspect(other)} (using \"linear\")")
+
+        "linear"
+    end
+  end
+
+  # Workflow state names are tracker-specific — YouTrack's stock workflow is
+  # Submitted/Open/In Progress/Fixed, nothing like Linear's Todo/In Progress —
+  # so a project must be able to name its own. Only a non-empty list of
+  # non-blank strings is honored; anything else warns and keeps the default,
+  # because a mistyped state list either polls nothing or (for
+  # `terminal_states`) treats finished work as still running.
+  defp state_list(config, key, default) do
+    case Map.get(config, key) do
+      nil ->
+        default
+
+      value ->
+        case normalize_state_list(value) do
+          [] ->
+            Logger.warning("Ignoring invalid #{key} in config.json: #{inspect(value)}")
+
+            default
+
+          states ->
+            states
+        end
+    end
+  end
+
+  # An explicit empty string is meaningful for all three: it turns off the
+  # dispatch transition, the review handoff, or the agent-merge flow for a
+  # workflow that has no such state. Any non-string falls back to the default.
+  defp tracker_state(config, key, default) do
+    case Map.get(config, key) do
+      value when is_binary(value) -> String.trim(value)
+      _ -> default
+    end
+  end
+
+  defp normalize_state_list(value) when is_list(value) do
+    if Enum.all?(value, &is_binary/1) do
+      value |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.uniq()
+    else
+      []
+    end
+  end
+
+  defp normalize_state_list(_value), do: []
+
+  defp tracker_string(config, key, legacy_key) do
+    case Map.get(config, key) do
+      value when is_binary(value) and value != "" -> value
+      _ -> Map.get(config, legacy_key, "")
+    end
+  end
+
+  # Bind address for the dashboard/API. The Schema default (`127.0.0.1`) is
+  # right for a daemon on a laptop and wrong inside a container, where the
+  # port has to be reachable from outside the network namespace — so this is
+  # emitted only when a project asks for it.
+  defp maybe_put_server(base, config) do
+    server =
+      %{}
+      |> maybe_put_string(config, "host", "server_host")
+      |> maybe_put_port(config)
+
+    if server == %{}, do: base, else: Map.put(base, "server", server)
+  end
+
+  defp maybe_put_port(server, config) do
+    case Map.get(config, "server_port") do
+      value when is_integer(value) and value >= 0 -> Map.put(server, "port", value)
+      _ -> server
+    end
+  end
+
+  defp maybe_put_string(section, config, field, key) do
+    case Map.get(config, key) do
+      value when is_binary(value) -> put_trimmed(section, field, String.trim(value))
+      _ -> section
+    end
+  end
+
+  defp put_trimmed(section, _field, ""), do: section
+  defp put_trimmed(section, field, value), do: Map.put(section, field, value)
 
   defp agent_kind(config) do
     kind = Map.get(config, "agent")
@@ -892,9 +1068,66 @@ defmodule CymphonyElixir.Cymphony.Config do
   end
 
   defp agent_section_map(config, "claude") do
-    %{"command" => Defaults.claude_command(), "output_format" => Defaults.output_format()}
+    %{
+      "command" => Defaults.claude_command(),
+      "output_format" => Defaults.output_format(),
+      "allowed_tools" => allowed_tools(config),
+      "permission_mode" => permission_mode(config)
+    }
+    |> maybe_put_bare_mode(config)
     |> maybe_put_provider_keys(config, "claude")
     |> maybe_put_extra_args(config, "claude")
+  end
+
+  # `--allowedTools`. Emitted rather than left to the Schema default because
+  # the default cannot know the tracker: an agent required by its prompt to
+  # update a ticket needs that tracker's MCP tools granted, and under `-p`
+  # there is no one to approve them interactively — the call just returns
+  # `permission_denied` and the run works around it with shell, spending turns.
+  #
+  # A `projects[]` entry may override with a list or a comma-separated string.
+  # Anything else is ignored and warned about, like `extra_args`: a mistyped
+  # grant is invisible until an agent is silently refused a tool.
+  defp allowed_tools(config) do
+    case Map.get(config, "allowed_tools") do
+      nil ->
+        Enum.join(Defaults.claude_allowed_tools(tracker_kind(config)), ",")
+
+      value when is_binary(value) ->
+        if String.trim(value) == "",
+          do: Enum.join(Defaults.claude_allowed_tools(tracker_kind(config)), ","),
+          else: value
+
+      value when is_list(value) ->
+        if Enum.all?(value, &is_binary/1) do
+          Enum.join(value, ",")
+        else
+          warn_invalid("allowed_tools", value)
+          Enum.join(Defaults.claude_allowed_tools(tracker_kind(config)), ",")
+        end
+
+      value ->
+        warn_invalid("allowed_tools", value)
+        Enum.join(Defaults.claude_allowed_tools(tracker_kind(config)), ",")
+    end
+  end
+
+  defp permission_mode(config) do
+    case Map.get(config, "permission_mode") do
+      value when is_binary(value) ->
+        if String.trim(value) == "", do: Defaults.claude_permission_mode(), else: value
+
+      nil ->
+        Defaults.claude_permission_mode()
+
+      value ->
+        warn_invalid("permission_mode", value)
+        Defaults.claude_permission_mode()
+    end
+  end
+
+  defp warn_invalid(key, value) do
+    Logger.warning("Ignoring invalid #{key} in config.json: #{inspect(value)}")
   end
 
   defp agent_section_map(config, "codex") do
@@ -912,6 +1145,20 @@ defmodule CymphonyElixir.Cymphony.Config do
     |> maybe_put_new_project(config)
     |> maybe_put_provider_keys(config, "antigravity")
     |> maybe_put_extra_args(config, "antigravity")
+  end
+
+  # `claude --bare` skips "keychain reads" among other things, so a session
+  # authenticated as a Claude Code *account* (rather than by an
+  # `ANTHROPIC_API_KEY` a provider exports) fails with
+  # "Not logged in · Please run /login". `bare_mode` is on by the schema
+  # default, so account auth needs an explicit `false` — and only an explicit
+  # `false`, so a typo cannot silently take the fast path away from every
+  # API-key project.
+  defp maybe_put_bare_mode(section, config) do
+    case Map.get(config, "claude_bare_mode") do
+      false -> Map.put(section, "bare_mode", false)
+      _ -> section
+    end
   end
 
   # `--new-project` is on by default in the adapter, so only an explicit `false`
@@ -1001,24 +1248,80 @@ defmodule CymphonyElixir.Cymphony.Config do
   end
 
   defp maybe_put_hooks(base, config) do
-    case Map.get(config, "github_repo_url", "") do
-      repo when is_binary(repo) and repo != "" ->
-        clone_url = github_clone_url(repo)
-        Map.put(base, "hooks", %{"after_create" => "git clone --depth 1 #{clone_url} .\n"})
-
-      _ ->
+    case repo_url(config) do
+      "" ->
         base
+
+      repo ->
+        clone_url = if rewrite_ssh_remote?(config), do: https_clone_url(repo), else: repo
+        Map.put(base, "hooks", %{"after_create" => "git clone --depth 1 #{clone_url} .\n"})
     end
   end
 
-  # Prefer HTTPS so clone uses `gh auth` / git credentials. A host SSH key
-  # is often a deploy key for a different repo; GitHub then reports
-  # "Repository not found" and the workspace stays empty.
-  defp github_clone_url(repo) do
+  @doc """
+  The project's repository URL: `repo_url`, else the legacy `github_repo_url`.
+
+  The key was named for GitHub before GitLab was supported; both are read so
+  existing `config.json` files keep working and neither the dashboard's
+  add-project form nor `POST /api/v1/projects` has to change.
+  """
+  @spec repo_url(map()) :: String.t()
+  def repo_url(config) when is_map(config) do
+    ["repo_url", "github_repo_url"]
+    |> Enum.find_value("", fn key ->
+      case Map.get(config, key) do
+        value when is_binary(value) -> nonblank(String.trim(value))
+        _ -> nil
+      end
+    end)
+  end
+
+  defp nonblank(""), do: nil
+  defp nonblank(value), do: value
+
+  # Rewriting an scp-style remote to HTTPS is right when the worker has no key
+  # of its own (a host SSH key is often a deploy key for a different repo), and
+  # wrong when the worker *is* the operator — a rootless-podman run mounts the
+  # invoker's `~/.ssh` and agent socket, so an SSH remote is the path of least
+  # resistance and forcing HTTPS demands a token they may not have. Only an
+  # explicit `false` opts out, matching `new_project` and `claude_bare_mode`.
+  defp rewrite_ssh_remote?(config), do: Map.get(config, "rewrite_ssh_remote") != false
+
+  @doc """
+  The project's tracker slug: `tracker_project_slug`, else `linear_project_slug`.
+
+  Same legacy pairing as `repo_url/1` — the key was named for Linear before
+  YouTrack was supported.
+  """
+  @spec project_slug(map()) :: String.t()
+  def project_slug(config) when is_map(config) do
+    ["tracker_project_slug", "linear_project_slug"]
+    |> Enum.find_value("", fn key ->
+      case Map.get(config, key) do
+        value when is_binary(value) -> nonblank(String.trim(value))
+        _ -> nil
+      end
+    end)
+  end
+
+  @doc """
+  Rewrites an `scp`-style SSH remote to its HTTPS equivalent.
+
+  Prefer HTTPS so the clone uses `gh`/`glab` credentials or the git credential
+  helper. A host SSH key is often a deploy key for a different repository; the
+  forge then reports "Repository not found" and the workspace stays empty.
+
+  Host-agnostic on purpose — `git@gitlab.example.com:group/subgroup/repo.git`
+  is as valid a remote as `git@github.com:owner/repo.git`, and self-hosted
+  GitLab is the common case. Anything that is not scp-style (an `https://` or
+  `ssh://` URL, a local path) is passed through untouched.
+  """
+  @spec https_clone_url(String.t()) :: String.t()
+  def https_clone_url(repo) when is_binary(repo) do
     trimmed = String.trim(repo)
 
-    case Regex.run(Regex.compile!("^git@github\\.com:([^/]+)/(.+?)(?:\\.git)?$"), trimmed) do
-      [_, owner, name] -> "https://github.com/#{owner}/#{name}.git"
+    case Regex.run(Regex.compile!("^git@([A-Za-z0-9._-]+):(.+?)(?:\\.git)?$"), trimmed) do
+      [_, host, path] -> "https://#{host}/#{path}.git"
       _ -> trimmed
     end
   end

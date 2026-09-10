@@ -193,7 +193,7 @@ CLI → CymphonyConfig → WorkflowStore → Orchestrator (GenServer, per-projec
 7. **ShellProvider** (`cymphony/shell_provider.ex`) — Reads provider env vars (API keys, model config) from shell functions in `~/.cld`, `~/.zshrc`, or `~/.bashrc`. Sources the rc files in a zsh subprocess with `claude`/`codex`/`agy`/`antigravity` noop'd, calls the provider function, and captures env vars matching the active agent's prefixes (Claude: `ANTHROPIC_*`/`CLAUDE_CODE_*`; Codex: `OPENAI_*`/`CODEX_*`; Antigravity: `ANTIGRAVITY_*`/`GOOGLE_*`/`GEMINI_*` plus `API_TIMEOUT`; fallback keys `GOOGLE_API_KEY`/`GEMINI_API_KEY`). Results are cached via `persistent_term`.
 8. **Agent behaviour** (`agent.ex`, `agent/runner.ex`, `agent/claude.ex`, `agent/codex.ex`, `agent/antigravity.ex`) — `Agent.Runner` owns the shared machinery (port spawn, SSH remoting, env injection, timeouts, workspace validation) and delegates argv construction + output parsing to the `CymphonyElixir.Agent` adapter for `agent.kind`. The Claude adapter drives `claude --bare -p … --resume`; the Codex adapter drives `codex exec --json` / `codex exec resume <id>` and parses its JSONL events; the Antigravity adapter drives `agy -p … --output-format stream-json` and resumes with `--conversation <id>` (never `-c`/`--continue`). The Antigravity adapter also appends two flags to **every** invocation it builds, fresh runs and `--conversation` resumes alike: `--new-project`, without which `agy` ignores its launch cwd and sandboxes itself into `~/.gemini/antigravity-cli/scratch` so no run ever writes into the Cymphony workspace and no PR is possible (escape hatch: `antigravity.new_project: false`; only an explicit `false` drops it); and `--log-file <workspace>/../.agy-<issue>.log`, because stdout only ever carries a generic "Agent execution terminated due to error." while the real cause (HTTP 400/429, auth) goes to the CLI's own log under `~/.gemini/antigravity-cli/log/<ts>.log`, which nothing can correlate to an issue. The log is a **sibling** of the workspace, never a file inside it: the workspace root is the cloned repo root and the prompt tells the agent to commit and push, so a log in the tree — which appends across retry attempts — lands in the pull request. The workspace comes from `run_spec.workspace` (the runner already snapshots it there for MCP descriptor writing) and the `..` is resolved lexically, so under SSH remoting the path names the remote workspace's sibling; the retention sweep removes stale `.agy-*.log` files along with stale workspaces. All three adapters append the active section's `extra_args` through the shared `Agent.append_extra_args/2` (non-empty string = raw trailing fragment, list = escaped item by item, anything else dropped); Codex puts them before the prompt, which stays its final positional. A nonzero CLI exit returns `{:agent_exit, status, tail}` where `tail` is a bounded tail of everything the CLI printed (newest 20 lines, then 2048 bytes, ANSI/control bytes stripped) — not just the unterminated leftover buffer, which is empty whenever the CLI printed a newline-terminated error line. That text is what the dashboard retry queue and the Linear abandonment comment show, so `AgentRunner` raises with the reason first (issue context follows in parentheses; the `Logger.error` above it is unchanged) and the Orchestrator records `Exception.message/1` for a `{exception, stacktrace}` task exit rather than the inspected tuple — the retry row truncates to 120 characters. The tail is ordered **newest line first** and the byte cap keeps the head, because every display truncates from the front after a ~50-character `agent exited: Agent run failed: {:agent_exit, 1, "` prefix; chronological order put the CLI's own error line past the cut on any streaming turn. Bounding, sanitizing, and redacting live in one shared helper, `Agent.failure_excerpt/1` (newest 20 lines, 2048 bytes, each line capped at 8 KB *before* the regexes — redaction cost is superlinear and a port line can be 1 MB): the runner's failure tail delegates to it, so the retry queue, `/api/v1/state`, the dashboard, and the Linear abandonment comment are covered by construction. A CLI that dies mid-request dumps its own environment, which published the live Linear API key to every one of those surfaces. The exit-0 failure paths are covered too: adapters never join a raw transcript into an error payload — `no_result_in_stream` / `no_json_output` / `json_decode_failed` carry `Agent.transcript_excerpt/1` and a decoded `turn_failed` payload goes through `Agent.redact_payload/1` (every binary in the structure, map keys kept). The live harness ring is redacted after its 2048-byte slice (`GET /api/v1/:issue/harness` and the dashboard pane carry the same bytes off the box); the on-disk debug transcript (`~/.cymphony/log/cymphony.log.N`) is deliberately **not** redacted — it never leaves the host and an operator debugging an auth failure needs the real bytes. Redacted (`Text.redact_secrets/1`): assignments (`NAME=v`, `NAME => v`, `NAME: v`, `"NAME": "v"`) whose name has a whole `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`PASSWD`/`PAT`/`CREDENTIAL`/`AUTHORIZATION`/`COOKIE` segment, a camelCase spelling (`apiKey`, `authToken`, `clientSecret`, …), or a compound `PWD`; `Authorization`/`Cookie` headers to end of line regardless of scheme (`Bearer`, `Basic`, or none — the scheme is not the secret); and bare vendor-prefixed credentials, case-insensitively (`sk-`, `lin_api_`, `gh[pousr]_`, `github_pat_`, `xox<a>-`, `AIza`, `ya29.`, `1//`, JWTs, `AKIA`, `npm_`, `hf_`). The variable name is kept so the diagnostic still says which one was involved. Two carve-outs keep diagnostics readable: the bare `NAME: value` form requires a **compound** name (`token: rate limit exceeded`, `Unexpected token: '<'`, and `KeyError: key: :model` survive; `MONKEY=banana` was never caught), and a name suffixed `_PATH`/`_FILE`/`_DIR`/`_ID`/`_NAME` keeps its value (`SSH_KEY_PATH=/home/…` names a location, not a secret). It is a redactor, not a scanner: an unnamed high-entropy string with no known prefix still passes through.
 9. **Workspace** (`workspace.ex`) — Isolated per-issue directories with path safety validation, lifecycle hooks (after_create, before_run, after_run, before_remove), and SSH worker support. Optional retention sweep (`workspace.retention_days` in config) deletes stale workspaces every 6 hours, skipping currently-running ones; it also removes stale `.agy-<issue>.log` session logs the Antigravity adapter writes beside workspaces (a plain file, so it gets no `before_remove` hook — the hook runs shell in a workspace directory).
-10. **Tracker** (`tracker.ex`) — Behaviour-based adapter for issue trackers. `Linear.Adapter` is the production implementation; `Tracker.Memory` is for testing.
+10. **Tracker** (`tracker.ex`) — Behaviour-based adapter for issue trackers, selected by `tracker.kind`: `Linear.Adapter` (`linear`), `YouTrack.Adapter` (`youtrack`), `Tracker.Memory` (`memory`, tests). Anything unrecognized falls back to Linear.
 
 ### Concurrency
 
@@ -280,6 +280,31 @@ CLI → CymphonyConfig → WorkflowStore → Orchestrator (GenServer, per-projec
   silently disable the watchdog or emit front matter that fails `Schema.parse/1`. There is no CLI
   flag, API route, or dashboard control for it; it is a hand-edited config key.
 
+### Tool grants (`allowed_tools` / `permission_mode`)
+
+`Cymphony.Config.to_schema_map/1` emits both into the generated `claude`
+section, so a config.json project never falls through to the Schema default.
+
+- **Default: `Bash,Read,Edit,Write,Glob,Grep` plus the tracker's MCP server**
+  (`mcp__linear` / `mcp__youtrack`), from
+  `Defaults.claude_allowed_tools/1`. The old `Bash,Read,Edit` was narrower than
+  the work the prompt asks for: an agent told to create files, publish a branch
+  and update its ticket was granted neither `Write` nor any tracker tool.
+- **Under headless `-p` an ungranted tool is not a prompt, it is a
+  `permission_denied`.** A real run logged four of them
+  (`mcp__youtrack__get_current_user`, `mcp__youtrack__get_issue`) and fell back
+  to `curl` through `Bash`. That is not just uglier — it costs turns, and since
+  every turn resends the whole prompt preamble, turns are what token spend
+  actually tracks.
+- Naming a server without a tool suffix grants all of its tools. A server that
+  is not configured contributes nothing, so the grant is safe when absent.
+- A `projects[]` entry may override with a list or a comma-separated string;
+  anything else (and a blank string) is ignored, warned about, and replaced by
+  the default — a mistyped grant is otherwise invisible until an agent is
+  silently refused a tool.
+- The Schema default (`config/schema.ex`) is widened to match but cannot be
+  tracker-aware; it only applies to hand-authored `WORKFLOW.md` files.
+
 ### Per-project `extra_args` / `new_project` (hand-edited config keys)
 
 Same shape as `stall_timeout_ms`: keys on a `projects[]` entry in `~/.cymphony/config.json` that
@@ -362,6 +387,253 @@ CymphonyElixir.Supervisor (one_for_one)
 ```
 
 Each project gets its own `ProjectSupervisor` with a `WorkflowStore` and `Orchestrator`, registered via `ProjectRegistry` for lookup by `{project_name, role}`.
+
+## Trackers
+
+`tracker.kind` picks the adapter. Everything below the `Tracker` behaviour's six
+callbacks is adapter-private; the orchestrator only ever sees
+`%CymphonyElixir.Linear.Issue{}` (the tracker-neutral issue struct — a YouTrack
+issue is normalized into it, not into a second struct).
+
+### YouTrack (`tracker.kind: "youtrack"`)
+
+`lib/cymphony_elixir/youtrack/` — `Client` (REST + paging), `Issue`
+(normalization), `Query` (search-query strings), `Adapter` (behaviour).
+
+Config, all on a `projects[]` entry in `~/.cymphony/config.json`:
+
+```json
+"tracker_kind": "youtrack",
+"tracker_endpoint": "https://example.youtrack.cloud",
+"tracker_api_key": "perm:…",
+"tracker_project_slug": "LLM",
+"tracker_assignee": "jeremy",
+"queued_states": ["Open"],
+"in_progress_state": "In Progress",
+"active_states": ["Open", "In Progress"],
+"terminal_states": ["Fixed", "Verified"]
+```
+
+`tracker_api_key`/`tracker_project_slug` fall back to the legacy
+`linear_api_key`/`linear_project_slug` keys, so the shape stays back-compatible.
+An unknown `tracker_kind` falls back to `linear` **and warns** — a silently
+wrong tracker polls the wrong system forever.
+
+Things that bite:
+
+- `tracker_endpoint` is the **instance root**, not the API root (a trailing `/`
+  or `/api` is normalized away). It is also required: the schema default is
+  Linear's GraphQL URL, so a YouTrack project without it is rejected as
+  `missing_youtrack_url` rather than sending a YouTrack token to
+  `api.linear.app`.
+- **State, Priority and Assignee are custom fields**, read by name. The state
+  field's name is **config** (`tracker.state_field`, default `State`) because
+  projects rename it — a real instance was found using `Stage` — and reading
+  the wrong name yields `state: nil`, which matches no active state and so
+  dispatches nothing, silently. `Priority`/`Assignee` stay fixed names: a miss
+  there only costs queue ordering or the assignee filter, not the whole loop.
+- **A state write reuses the field's own `$type`.** `update_issue_state/3`
+  reads `customFields($type,name)` first and echoes the type back, because a
+  renamed state field is often a plain enum rather than a
+  `StateIssueCustomField` and YouTrack rejects a mismatch; the stock type is
+  only the fallback.
+- Priority is an enum name mapped onto Linear's 1..4 queue rank
+  (Show-stopper/Critical/Urgent → 1 … Minor/Low → 4, else unranked).
+- `issue.id` **and** `issue.identifier` are both `idReadable` (`LLM-51`), so
+  every write, log line and dashboard row names the issue the way a human does.
+- The search query narrows by project and state; the decoded issues are then
+  filtered by state name locally, so a query-syntax surprise cannot leak a
+  non-active issue into a dispatch.
+- Blockers come from `links`, matching the phrase for *this* end of the link
+  (`sourceToTarget` for `OUTWARD`, `targetToSource` for `INWARD`, else the type
+  name) against `depends on` / `is blocked by` / `blocked by`. `subtask of` is
+  deliberately excluded — a subtask is not blocked by its parent.
+- A `404` refreshing a running issue means "no longer active", not a failed
+  reconcile pass.
+- Agents get `YOUTRACK_URL`/`YOUTRACK_TOKEN`/`YOUTRACK_PROJECT` in their
+  environment (mirroring the `LINEAR_API_KEY` injection). No MCP descriptor is
+  written — `Mcp.ConfigWriter.descriptor_from_config/1` matches `kind: "linear"`
+  only. The dashboard's Linear drawer and `/api/v1/linear*` routes are Linear's
+  alone and are simply unused by a YouTrack project.
+
+### Workflow state names are config, not constants
+
+`tracker.queued_states` (default `["Todo"]`) and `tracker.in_progress_state`
+(default `"In Progress"`) exist because the words for "queued" and "started"
+belong to the tracker, not to Cymphony. Both the dispatch transition
+(`transition_to_in_progress/2`) and the blocker gate
+(`queued_issue_blocked_by_non_terminal?/3`) read them. Hardcoding `"todo"`
+meant a YouTrack project dispatched work but never moved the issue and never
+honored a blocker. A blank `in_progress_state` skips the transition entirely,
+for a workflow that has no such state. `active_states`/`terminal_states` are
+likewise per-project config keys now; only a list of strings is honored,
+anything else warns and keeps the default (a mistyped list either polls
+nothing or treats finished work as running).
+
+## Workflow states are config, and so is the prompt's status map
+
+The prompt used to hardcode Linear's `Backlog`/`Todo`/`In Progress`/
+`Human Review`/`Merging`/`Rework`/`Done`. It renders from config now, because
+the words for each stage belong to the tracker: a YouTrack project running
+`Open`/`Confirmed`/`In Progress`/`Review and Testing` must not be told to move
+tickets to states it does not have.
+
+Five `tracker` settings define the machine (all with Linear-shaped defaults, so
+existing projects render exactly as before):
+
+| Setting | Meaning |
+|---|---|
+| `queued_states` | Not started. Blocker-gated; dispatch transitions out of these. |
+| `in_progress_state` | Where a dispatched issue is moved. Blank skips the transition. |
+| `review_state` | Where the agent hands off to a human once the change is published. |
+| `merge_state` | "Approved, go merge." **Blank means humans merge** and the prompt drops the entire land/merge protocol. |
+| `active_states` | The re-dispatch set (see below). |
+
+**`active_states` is the load-bearing one.** It means *keep re-dispatching an
+agent until the issue leaves this set*: when a run ends, the orchestrator
+re-reads the issue and either cleans up (terminal), retries with backoff (still
+active), or releases the claim (anything else) — `orchestrator.ex:1291-1303`.
+So `review_state` must **not** be in `active_states`, or agents thrash on
+tickets that are waiting on a reviewer. This is why Linear's default active set
+is `Todo, In Progress, Merging, Rework` and pointedly excludes `Human Review`.
+
+Prompt-side rules:
+
+- `PromptBuilder.workflow_variables/1` builds the `workflow` variable; the
+  template loops over `workflow.queued_states` / `terminal_states` and branches
+  on `{% if workflow.merge_state %}`.
+- **A blank merge state must reach Liquid as `nil`, never `""`** — Liquid treats
+  an empty string as truthy, so `""` renders the merge protocol with an empty
+  state name (`` `` -> approved by human``). `blank_to_nil/1` exists for exactly
+  that; `prompt_workflow_test.exs` refutes the empty-backtick output.
+- `workflow.other_active_states` lists active states the status map does not
+  otherwise describe (Linear's `Rework`). Without it the prompt files a state
+  Cymphony actively dispatches on under "out of scope: stop".
+- `PromptBuilder.tracker_variables/1` supplies `tracker.name` and
+  `tracker.access` — how the agent reaches the tracker. Linear gets the MCP
+  server written into the workspace; YouTrack gets `$YOUTRACK_URL`/`$YOUTRACK_TOKEN`
+  and talks to the REST API, because `Mcp.ConfigWriter` writes no descriptor for
+  it.
+
+## Forges (GitHub / GitLab)
+
+`forge` is a top-level workflow setting (`github` default, `gitlab`), generated
+from `projects[].forge` in `~/.cymphony/config.json`. It is not just
+credentials — it changes what the agent is *told to do*.
+
+- **The prompt is one document for both forges.** Everything that differs is a
+  Liquid variable supplied by `PromptBuilder.forge_variables/1`: `forge.name`,
+  `forge.cli`, `forge.review` / `forge.review_abbr` (pull request/PR vs merge
+  request/MR), `forge.merge_command`, and the three review-reading commands
+  (`forge.comments_command`, `forge.inline_comments_command`,
+  `forge.reviews_command`). Rendering runs with `strict_variables: true`, so
+  the map is always in the context — including for a hand-authored prompt that
+  never reads it. Never hardcode `gh`, `PR` or `GitHub` back into
+  `PromptTemplate`; `prompt_builder_forge_test.exs` refutes each of them in the
+  GitLab rendering.
+- **The branch name is config, not the agent's invention.** `branch_name_template`
+  (top-level, default `{{ issue.identifier }}`) is rendered against the issue by
+  `PromptBuilder.branch_name/2` and reaches the prompt as `{{ branch_name }}`,
+  which instructs the agent to use that name exactly. The prompt previously said
+  nothing about branch naming and never exposed `issue.branch_name`, so every run
+  invented its own (`HC-1-hello-world-static-page`). The rendered value is
+  sanitized into a legal git ref (`sanitize_branch/1`) and a template that renders
+  blank or raises falls back to the identifier with a warning — a typo in an
+  operator template must not take the run down.
+- Resolution is `opts[:forge]` → `config.forge` → `github`. An unrecognized
+  value is logged and falls back at both layers (`Schema.Forge`, a lenient
+  Ecto type like `LenientBoolean`, and `Cymphony.Config.forge/1`) rather than
+  failing `Schema.parse/1` over a typo.
+- **The clone-URL rewrite is host-agnostic.** `Cymphony.Config.https_clone_url/1`
+  turns any `scp`-style `git@host:path` remote into `https://host/path.git`,
+  not just `git@github.com:`. A container has no SSH key, and GitLab nested
+  groups (`group/subgroup/repo`) have to survive the rewrite. Anything that is
+  already a URL passes through untouched.
+- **`repo_url` is the current config key**; `github_repo_url` predates GitLab
+  support and is still read (`Cymphony.Config.repo_url/1` prefers the former)
+  and still what the dashboard's add-project form posts. `POST /api/v1/projects`
+  accepts both.
+- **Forge credentials live in config**, like the tracker's: `forge_token` and
+  `forge_host` (top-level, `$VAR_NAME` indirection supported) are injected into
+  the agent's environment as `GITLAB_TOKEN`/`GLAB_TOKEN`/`GITLAB_HOST` or
+  `GH_TOKEN`/`GITHUB_TOKEN` depending on `forge`. `finalize_settings/1`
+  deliberately gives them **no** environment fallback: `Agent.Runner` inherits
+  those variables anyway and overlays config on top, so nil means "use the
+  environment". Defaulting the field from the environment instead collapsed
+  independently-exported `GH_TOKEN` and `GITHUB_TOKEN` into a single value.
+- `Agent.Runner` inherits `GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`,
+  `GLAB_TOKEN` and `GITLAB_HOST` from the daemon environment
+  (`@forge_env`) — `GITLAB_HOST` matters because without it `glab` talks to
+  gitlab.com on a self-hosted instance.
+- `Text.redact_secrets/1` covers GitLab's token prefixes (`glpat-`, `gldt-`,
+  `glrt-`, `glft-`, `gloas-`, `glcbt-`, `glsoat-`, `glptt-`) alongside the
+  GitHub ones, so a token in a failure excerpt or a clone URL is masked.
+- Still GitHub-only and unused by a GitLab project: `mix workspace.before_remove`
+  (closes open PRs via `gh`) and `mix pr_body.check`. Both are opt-in.
+
+## Rootless Podman (local)
+
+`compose.yaml` + `docker/Dockerfile` run the orchestrator locally. Full guide:
+`docs/podman.md`. The container is a **dependency sandbox, not a security
+boundary**: it pins the toolchain and then runs as the invoking user against
+that user's real home.
+
+- **It runs as you.** `userns_mode: keep-id` maps the invoking uid straight
+  through and `$HOME` is bind-mounted at the same path, so `~/.cymphony`,
+  `~/.claude`, `~/.cld` and `~/.gitconfig` are the real files and everything the
+  agent writes is owned by you on the host. The image has no application user
+  and no `USER` directive — it is uid-agnostic, needing only `$HOME` and `/tmp`
+  writable.
+- **SELinux: never `:z`/`:Z` on the `$HOME` mount** — that recursively relabels
+  the user's entire home. `security_opt: label=disable` is the correct trade
+  for a container that is meant to see the home directory.
+- **`network_mode: host`** keeps `server.host` at `127.0.0.1`, so a config that
+  works natively works containerized with no changes.
+- **`rewrite_ssh_remote: false`** keeps an scp-style remote as written instead
+  of rewriting it to HTTPS. The rewrite assumes the worker has no key of its
+  own; under run-as-me that assumption is false — `~/.ssh` and the agent socket
+  are in the mounted home — and forcing HTTPS demands a token the operator may
+  not have. `Agent.Runner`'s `@passthrough_env` carries `SSH_AUTH_SOCK` for the
+  same reason: workspace hooks inherit the daemon's full env so the clone
+  works, but the agent's own `git push` gets the curated env only, so without
+  the socket the clone succeeds and the push fails.
+- **Config is never generated.** `~/.cymphony/config.json` is the operator's
+  file (`cymphony setup` or hand-edited); the entrypoint only preflights and
+  refuses to start with instructions when it is missing. It must not point at
+  `cymphony setup`: the wizard asks Linear/GitHub questions only
+  (`Linear project slug`, `GitHub repo URL`) and writes `linear_*` keys, so it
+  produces the wrong shape for a YouTrack or GitLab project. It also warns — never
+  fixes — about missing Claude credentials or forge auth, because each of those
+  is the operator's own environment.
+- **`CYMPHONY_ARGS` is the argv channel.** An OTP release's `start` does not
+  forward arguments, so `BurritoCLI.cli_args/0` falls back to that env var
+  (quote-aware via `split_args/1`) when argv is empty. This is the only way to
+  reach `setup`, `list` or the run flags in the container; real argv still wins,
+  so the Burrito binary is unaffected.
+- `podman compose` delegates to the Docker Compose plugin and needs
+  `systemctl --user enable --now podman.socket`; without it every command fails
+  with `failed to connect to the docker API at …/podman.sock`. `docs/podman.md`
+  also gives the plain `podman run` equivalent.
+- **Base images are fully qualified** (`docker.io/hexpm/...`): podman enforces
+  short-name resolution and refuses a bare name non-interactively.
+- Provider rotation works here (unlike a locked-down container): `zsh` is in the
+  image and `~/.cld` is part of the mounted home.
+- **Agent toolchains are bundled, not borrowed from the home mount.** The
+  image installs the .NET SDK to `/usr/local/dotnet` (`DOTNET_ROOT`) and
+  Playwright's Chromium to `/usr/local/ms-playwright`
+  (`PLAYWRIGHT_BROWSERS_PATH`), both `ARG`-pinned. Reading them out of the
+  operator's `~/.dotnet` / `~/.cache/ms-playwright` would mean the container
+  only works on a machine that already has them, which defeats pinning the
+  toolchain. Their shared libraries are apt packages in the same image:
+  `libicu76` (the SDK will not start without it, and the
+  `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1` workaround quietly disables
+  casefolding/diacritic folding) and the GTK/X11/NSS set (Chromium dies on
+  `libglib-2.0.so.0`). Note the trixie `t64` package names — plain
+  `libglib2.0-0` does not exist there. Verified against an **empty** home, not
+  by trusting the package list.
+- The build is still `mix release cymphony_docker` with `BURRITO_BUILD=1` — an
+  escript cannot carry exqlite's NIF, so an escript image dies at boot with
+  `Exqlite.Sqlite3NIF.open/2 undefined`.
 
 ## Web Dashboard
 

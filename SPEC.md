@@ -403,15 +403,66 @@ Note:
 - Common extension: `server.port` (integer) enables the optional HTTP server described in Section
   13.7.
 
+#### 5.3.0 `forge` (string)
+
+- Code-hosting platform the project's repository lives on: `github` (default) or `gitlab`.
+- Generated from `projects[].forge` in `~/.cymphony/config.json`. An unrecognized value is
+  logged and falls back to the default at both layers rather than failing `Schema.parse/1`.
+- Two behaviors depend on it:
+  - **Prompt status map.** The prompt's state machine renders from `queued_states`,
+    `in_progress_state`, `review_state`, `merge_state`, `active_states` and `terminal_states`
+    rather than hardcoding one tracker's names. Active states not otherwise described are
+    listed as work states, so a state the orchestrator dispatches on is never presented to the
+    agent as out of scope.
+  - **Prompt vocabulary.** The default prompt is one document for both forges; the CLI binary,
+    what a change proposal is called (pull request/PR vs merge request/MR), the merge command
+    and the three review-reading commands are Liquid variables supplied at render time. A
+    GitLab project must never be instructed to run `gh`.
+  - **Credentials.** `forge_token` and `forge_host` (top level, `$VAR_NAME` indirection
+    supported) are handed to the agent under the variable names the forge CLI reads. They have
+    no environment default: the runner already inherits those variables and overlays config on
+    top, so an absent setting means "use the environment", and a present one wins.
+  - **Credentials** (extension): the container installs `glab auth git-credential` or
+    `gh auth setup-git` accordingly, and the agent inherits `GH_TOKEN`/`GITHUB_TOKEN`/
+    `GITLAB_TOKEN`/`GLAB_TOKEN`/`GITLAB_HOST` from the daemon environment.
+- The repository itself is `projects[].repo_url` (legacy alias: `github_repo_url`), which
+  becomes the `hooks.after_create` clone command. An `scp`-style `git@host:path` remote is
+  rewritten to `https://host/path.git` **for any host**, because a containerized worker has no
+  SSH key and a host key is often a deploy key for a different repository. Nested GitLab groups
+  survive the rewrite; anything already in URL form passes through untouched.
+  `projects[].rewrite_ssh_remote: false` disables the rewrite for a worker that *does* hold the
+  operator's keys (a rootless container running as the invoker with `~/.ssh` mounted); only an
+  explicit `false` counts.
+
+#### 5.3.0.1 `branch_name_template` (string)
+
+- Liquid template for the branch a run creates, rendered against the issue. Default:
+  `{{ issue.identifier }}`.
+- Reaches the prompt as `{{ branch_name }}`, and the prompt instructs the agent to use it
+  verbatim. Absent such an instruction the agent picks a name per run, which is unpredictable
+  and awkward to correlate with the tracker.
+- The rendered value is sanitized into a legal git ref (whitespace to `-`, ref-forbidden
+  characters dropped, edges trimmed). A template that renders blank or fails falls back to the
+  issue identifier and logs a warning.
+
 #### 5.3.1 `tracker` (object)
 
 Fields:
 
 - `kind` (string)
   - Required for dispatch.
-  - Current supported value: `linear`
+  - Supported values: `linear`, `youtrack` (plus `memory`, the in-process test adapter).
+  - The generated per-project `WORKFLOW.md` gets this from `projects[].tracker_kind` in
+    `~/.cymphony/config.json`; an unknown value there falls back to `linear` **and logs a
+    warning**, because a silently-wrong tracker polls the wrong system forever.
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
+  - Required for `tracker.kind == "youtrack"`: the instance root, e.g.
+    `https://example.youtrack.cloud`. A trailing `/` or `/api` is tolerated and normalized
+    away; the API root and the human-facing issue URLs are both derived from it. Because the
+    schema default is Linear's GraphQL URL, a YouTrack tracker that leaves `endpoint` unset is
+    rejected as `missing_youtrack_url` rather than sending a YouTrack token to
+    `api.linear.app`.
 - `api_key` (string)
   - May be a literal token or `$VAR_NAME`.
   - Durable operator store for Linear credentials is `~/.cymphony/config.json`:
@@ -431,11 +482,55 @@ Fields:
     dashboard Connect and `POST /api/v1/linear` persist the durable file key.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
 - `project_slug` (string)
-  - Required for dispatch when `tracker.kind == "linear"`.
+  - Required for dispatch when `tracker.kind == "linear"` or `"youtrack"`. For YouTrack this
+    is the project's short name (the `LLM` in `LLM-51`).
+- `review_state` (string)
+  - Default: `Human Review`. Where the agent moves an issue once the change is published and a
+    human owns it. Must not appear in `active_states`: the orchestrator re-dispatches until an
+    issue leaves the active set, so a review state inside it produces agents that thrash on
+    tickets awaiting a reviewer.
+- `merge_state` (string)
+  - Default: `Merging`. The state meaning "approved, go merge". **Blank means humans merge**;
+    the rendered prompt then omits the land/merge protocol entirely rather than naming a state
+    the workflow does not have.
+- `assignee` (string)
+  - Optional routing filter. For YouTrack it is compared case-insensitively against the
+    issue's Assignee login; an unassigned issue is **not** routed when the filter is set.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
+  - Per-project override: `projects[].active_states` in `~/.cymphony/config.json`. Only a
+    list of strings is honored (blank entries dropped, duplicates collapsed); anything else
+    warns and keeps the default. Required in practice for YouTrack, whose stock workflow is
+    `Open`/`In Progress`/`Fixed`, nothing like Linear's.
 - `terminal_states` (list of strings)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+  - Per-project override: `projects[].terminal_states`, same validation as `active_states`.
+
+##### YouTrack adapter specifics (`tracker.kind == "youtrack"`)
+
+- Transport is the REST API (`GET /api/issues`, `POST /api/issues/{id}/comments`,
+  `POST /api/issues/{id}`) with the permanent token as a bearer token. Reads page through
+  `$top`/`$skip` and stop at a 50-page cap (logged).
+- Issue identity is `idReadable` (`LLM-51`) for **both** `id` and `identifier`, so every
+  write, log line and dashboard row names the issue the way a human does.
+- State, Priority and Assignee are read out of `customFields` **by name**. The state field's
+  name is configurable (`tracker.state_field`, default `State`) because YouTrack projects rename
+  it; reading the wrong name reports `state: nil` and never dispatches. A state write reads the
+  field's `$type` from the issue and echoes it back, falling back to `StateIssueCustomField`.
+- Priority is an enum name mapped onto Linear's integer rank used for queue ordering:
+  Show-stopper/Critical/Urgent → 1, Major/High → 2, Normal/Medium → 3, Minor/Low → 4,
+  anything else → unranked (sorts last).
+- The search query narrows by project and state, and the decoded issues are then filtered by
+  state name locally, so a query-syntax surprise can never leak a non-active issue.
+- Blockers come from `links`: an entry counts when the phrase for *this* end of the link
+  (`sourceToTarget` for `OUTWARD`, `targetToSource` for `INWARD`, else the type name) is one
+  of `depends on`, `is blocked by`, `blocked by`. `subtask of` is deliberately excluded.
+- A `404` on a running issue's refresh is treated as "no longer active" instead of failing
+  the whole reconcile pass.
+- Agents get `YOUTRACK_URL`, `YOUTRACK_TOKEN` and `YOUTRACK_PROJECT` in their process
+  environment, mirroring the `LINEAR_API_KEY` injection for Linear projects. No MCP server is
+  written for YouTrack projects (`Mcp.ConfigWriter.descriptor_from_config/1` matches
+  `kind: "linear"` only).
 
 #### 5.3.2 `polling` (object)
 
@@ -789,6 +884,10 @@ Error classes:
 - `workflow_front_matter_not_a_map`
 - `template_parse_error` (during prompt rendering)
 - `template_render_error` (unknown variable/filter, invalid interpolation)
+- `missing_tracker_kind`, `{unsupported_tracker_kind, kind}`
+- `missing_linear_api_token`, `missing_linear_project_slug` (`kind: "linear"`)
+- `missing_youtrack_token`, `missing_youtrack_url`, `missing_youtrack_project`
+  (`kind: "youtrack"`)
 
 Dispatch gating behavior:
 
@@ -2032,6 +2131,35 @@ Token accounting rules:
      mid-turn)
   6. Existing Claude paths (`params.msg…total_token_usage`, `tokenUsage.total`,
      `method == "turn/completed"`)
+  7. `payload["type"] == "assistant"` → `payload["message"]["usage"]` — Claude
+     Code's `stream-json` per-message usage, which sits one level below the
+     envelope. Nothing above looks there, so without this rule a whole Claude
+     run contributes nothing and the counters stay at zero.
+- **Shape 7 is additive, every other shape is absolute.** A per-message amount
+  must be summed, not diffed: Claude's `input_tokens` sits at the same small
+  value on every turn and never rises, so the absolute rule below scores each
+  one as zero. `extract_token_usage/1` returns the mode alongside the map and
+  `compute_token_delta/5` branches on it.
+  - An additive frame writes the **running sum** back as its reported value, so
+    a later absolute frame (the CLI's final `result`) diffs against what has
+    already been counted and contributes only the correction. Without that the
+    session would be counted twice.
+  - The absolute `result` frame cannot be relied on to arrive at all: an agent
+    that ends a run by moving its ticket out of the active states is killed by
+    the next poll before the CLI prints it. Per-message accrual is what makes
+    the counter move during a run rather than in one lump that may never land.
+- **Claude's cache *write* bucket is part of input; the *read* bucket is not.**
+  `input_tokens` holds only the uncached remainder — in a real transcript, `2`
+  against a cached prefix of `56904` — so `cache_creation_input_tokens` is
+  added to it. `cache_read_input_tokens` is excluded: it re-reports the entire
+  cached prefix on every turn, so summing it counts one conversation's context
+  once per turn. A measured two-hour, 41-turn pair of runs produced 1,952,593
+  cache-read tokens against 122,192 of everything else, a headline 94% composed
+  of re-reads that reads like months of usage and tracks cost badly (reads bill
+  at ~10% of the input rate). The reported figure is therefore the work the run
+  caused: fresh input, cache writes, and output. Antigravity's
+  `cache_read_tokens` is excluded for a different reason — its `result` usage
+  already reports an inclusive `input_tokens`.
 - Prefer absolute thread totals when available, such as:
   - `thread/tokenUsage/updated` payloads
   - `total_token_usage` within token-count wrapper events
@@ -2092,7 +2220,24 @@ Enablement (extension):
 - `server.port` must be an integer. Positive values bind that port. `0` may be used to request an
   ephemeral port for local development and tests.
 - Implementations should bind loopback by default (`127.0.0.1` or host equivalent) unless explicitly
-  configured otherwise.
+  configured otherwise. `server.host` is that explicit configuration; a containerized daemon must
+  set it to `0.0.0.0` or the port is unreachable outside its network namespace. The listener is
+  started only after the workflow settings are visible, so a configured host is never lost to boot
+  ordering (the supervision tree comes up before the CLI has generated any workflow).
+- A containerized daemon that shares the host network namespace (rootless Podman with
+  `network_mode: host`) needs no override at all: loopback inside is loopback outside, so the
+  same `server.host` works natively and containerized.
+- Generation keys: `projects[].server_port` and `projects[].server_host` in
+  `~/.cymphony/config.json` are written into the generated `WORKFLOW.md` `server` section. Only a
+  non-negative integer port and a non-blank host are emitted; the section is absent otherwise.
+- `projects[].claude_bare_mode: false` emits `claude.bare_mode: false`. `claude --bare` skips
+  keychain and credential reads, so a run authenticated as a Claude Code account (rather than by
+  a provider-exported `ANTHROPIC_API_KEY`) fails with "Not logged in". Only an explicit `false`
+  emits the key.
+- `projects[].status_dashboard_enabled: false` emits `observability.dashboard_enabled: false`,
+  which turns off the terminal status TUI — appropriate whenever stdout is a log stream rather
+  than a terminal. Only an explicit `false` counts. The TUI still paints one frame at boot,
+  before any workflow is loaded.
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 

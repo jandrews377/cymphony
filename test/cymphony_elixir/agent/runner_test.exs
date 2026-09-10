@@ -465,6 +465,124 @@ defmodule CymphonyElixir.Agent.RunnerTest do
     end
   end
 
+  test "app server exposes forge credentials from config, overriding the shell env" do
+    test_root =
+      Path.join(System.tmp_dir!(), "cymphony-elixir-forge-env-#{System.unique_integer([:positive])}")
+
+    previous_gitlab_token = System.get_env("GITLAB_TOKEN")
+    previous_gitlab_host = System.get_env("GITLAB_HOST")
+
+    on_exit(fn ->
+      restore_env("GITLAB_TOKEN", previous_gitlab_token)
+      restore_env("GITLAB_HOST", previous_gitlab_host)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "HC-1")
+      claude_binary = Path.join(test_root, "fake-claude")
+      trace_file = Path.join(test_root, "claude-env.trace")
+
+      File.mkdir_p!(workspace)
+      # An inherited value must lose to the configured one, or a stale export
+      # in the launching shell silently wins over config.json.
+      System.put_env("GITLAB_TOKEN", "from-the-shell")
+      System.put_env("GITLAB_HOST", "shell.example.com")
+
+      File.write!(claude_binary, """
+      #!/bin/sh
+      {
+        printf 'GITLAB_TOKEN=%s\\n' "$GITLAB_TOKEN"
+        printf 'GLAB_TOKEN=%s\\n' "$GLAB_TOKEN"
+        printf 'GITLAB_HOST=%s\\n' "$GITLAB_HOST"
+        printf 'GH_TOKEN=%s\\n' "$GH_TOKEN"
+      } > "#{trace_file}"
+      echo '{"result":"done","session_id":"sess-forge"}'
+      """)
+
+      File.chmod!(claude_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        forge: "gitlab",
+        forge_token: "glpat-from-config",
+        forge_host: "gitlab.example.com",
+        claude_command: claude_binary
+      )
+
+      issue = %Issue{id: "HC-1", identifier: "HC-1", title: "Forge env", state: "Open"}
+
+      assert {:ok, %{session_id: "sess-forge"}} = Runner.run(workspace, "do the thing", issue)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "GITLAB_TOKEN=glpat-from-config"
+      assert trace =~ "GLAB_TOKEN=glpat-from-config"
+      assert trace =~ "GITLAB_HOST=gitlab.example.com"
+      # A gitlab project must not also be handed GitHub's variable.
+      assert trace =~ "GH_TOKEN=\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server exposes YouTrack auth env to local Claude process" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "cymphony-elixir-app-server-youtrack-env-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "LLM-7")
+      claude_binary = Path.join(test_root, "fake-claude")
+      trace_file = Path.join(test_root, "claude-env.trace")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(claude_binary, """
+      #!/bin/sh
+      {
+        printf 'YOUTRACK_URL=%s\\n' "$YOUTRACK_URL"
+        printf 'YOUTRACK_TOKEN=%s\\n' "$YOUTRACK_TOKEN"
+        printf 'YOUTRACK_PROJECT=%s\\n' "$YOUTRACK_PROJECT"
+        printf 'LINEAR_API_KEY=%s\\n' "$LINEAR_API_KEY"
+      } > "#{trace_file}"
+      echo '{"result":"done","session_id":"sess-youtrack"}'
+      """)
+
+      File.chmod!(claude_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        tracker_kind: "youtrack",
+        tracker_endpoint: "https://example.youtrack.cloud/api/",
+        tracker_api_token: "perm:youtrack-token",
+        tracker_project_slug: "LLM",
+        claude_command: claude_binary
+      )
+
+      issue = %Issue{
+        id: "LLM-7",
+        identifier: "LLM-7",
+        title: "Environment passing",
+        state: "In Progress"
+      }
+
+      assert {:ok, %{session_id: "sess-youtrack"}} = Runner.run(workspace, "do the thing", issue)
+
+      trace = File.read!(trace_file)
+      # The instance root, not the API root the poller talks to.
+      assert trace =~ "YOUTRACK_URL=https://example.youtrack.cloud\n"
+      assert trace =~ "YOUTRACK_TOKEN=perm:youtrack-token"
+      assert trace =~ "YOUTRACK_PROJECT=LLM"
+      # The Linear key injection is keyed off tracker.kind, so it stays absent.
+      assert trace =~ "LINEAR_API_KEY=\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server exports Linear and GitHub auth env to ssh Claude process" do
     test_root =
       Path.join(

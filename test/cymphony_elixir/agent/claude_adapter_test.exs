@@ -183,6 +183,6 @@ defmodule CymphonyElixir.Agent.ClaudeAdapterTest do
   test "auth env callbacks" do
     assert Claude.default_command() == "claude"
     assert Claude.auth_env_prefixes() == ["ANTHROPIC_", "API_TIMEOUT", "CLAUDE_CODE_"]
-    assert Claude.auth_env_fallback() == ["ANTHROPIC_API_KEY"]
+    assert Claude.auth_env_fallback() == ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
   end
 end
